@@ -108,6 +108,86 @@ def _solve_assignment(cost: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 CLASSIFICATION_COSTS = ("prob", "nll", "clipped_nll")
 
 
+class HomoscedasticLossWeighting(nn.Module):
+    """Learn task weights through homoscedastic log variances."""
+
+    def __init__(self, initial_weights: dict[str, float]):
+        super().__init__()
+        # Inspired by Kendall et al., arXiv:1705.07115, with s = log(sigma^2).
+        # Their regression factor 0.5 only shifts s by a constant and does not
+        # change optimization of the effective weight, so all terms use exp(-s).
+        # Each task contributes exp(-s) * L + 0.5 * s, with effective weight
+        # w = exp(-s). Its gradient is d/ds = 0.5 - w * L: when w * L > 0.5,
+        # gradient descent increases s and lowers w; when w * L < 0.5, it lowers
+        # s and raises w. Thus each task independently moves towards w * L = 0.5.
+        #
+        # This balances loss magnitudes, not necessarily gradient magnitudes or
+        # downstream performance: tasks still interact through the shared model
+        # parameters. The +0.5*s term prevents every w simply collapsing to zero.
+        self.log_variances = nn.ParameterDict()
+        self._active_terms: dict[str, torch.Tensor] = {}
+        for name, weight in initial_weights.items():
+            if weight <= 0:
+                continue
+            # Choose s so exp(-s) equals the configured initial weight.
+            initial_log_variance = -math.log(weight)
+            self.log_variances[name] = nn.Parameter(
+                torch.tensor(initial_log_variance, dtype=torch.float32)
+            )
+
+    def effective_weights(self) -> dict[str, torch.Tensor]:
+        return {
+            name: torch.exp(-log_variance)
+            for name, log_variance in self.log_variances.items()
+        }
+
+    def forward(
+        self,
+        losses: dict[str, torch.Tensor],
+        supervision_counts: dict[str, torch.Tensor | int],
+    ) -> torch.Tensor:
+        if not self.log_variances:
+            return next(iter(losses.values())).new_zeros(())
+
+        total = next(iter(losses.values())).new_zeros(())
+        for name, log_variance in self.log_variances.items():
+            if name not in losses:
+                raise KeyError(f"Missing loss for automatic weight {name!r}.")
+            count = torch.as_tensor(
+                supervision_counts[name], device=losses[name].device
+            )
+            is_supervised = (count > 0).to(dtype=losses[name].dtype)
+            if torch.is_grad_enabled():
+                active = (count > 0) & (losses[name].detach() > 0)
+                previous = self._active_terms.get(name)
+                self._active_terms[name] = (
+                    active if previous is None else previous | active
+                )
+            # At exact equilibrium the log-variance gradient is already zero.
+            # A raw loss of zero is different: only the +0.5*s term remains and
+            # would increase the effective weight without bound. Freeze s for
+            # that batch while preserving the loss's model-gradient path.
+            active_log_variance = torch.where(
+                losses[name].detach() > 0,
+                log_variance,
+                log_variance.detach(),
+            )
+            # The 0.5 * s term prevents the learned weight collapsing to zero.
+            total = total + is_supervised * (
+                torch.exp(-active_log_variance) * losses[name]
+                + 0.5 * active_log_variance
+            )
+        return total
+
+    def freeze_inactive_log_variances(self) -> None:
+        """Prevent AdamW momentum from moving unsupervised or zero-loss terms."""
+        for name, log_variance in self.log_variances.items():
+            active = self._active_terms.get(name)
+            if active is not None and not bool(active):
+                log_variance.grad = None
+        self._active_terms.clear()
+
+
 def _classification_cost_matrix(
     pred_logits: torch.Tensor,
     target_classes: torch.Tensor,
@@ -416,6 +496,7 @@ class SetCriterion(nn.Module):
         loss_soft_parent_charge_weight: float = 0.0,
         loss_soft_parent_decay_mode_weight: float = 0.0,
         parent_objectness_temperature: float = 0.1,
+        automatic_weight_optimization: bool = False,
         no_object_class_index: int = 1,
         object_class_index: int = 0,
         eos_coef: float = 0.1,
@@ -437,6 +518,59 @@ class SetCriterion(nn.Module):
         self.loss_soft_parent_kinematics_weight = loss_soft_parent_kinematics_weight
         self.loss_soft_parent_charge_weight = loss_soft_parent_charge_weight
         self.loss_soft_parent_decay_mode_weight = loss_soft_parent_decay_mode_weight
+        configured_loss_weights = {
+            "objectness": loss_objectness_weight,
+            "tau_id": loss_tau_id_weight,
+            "kinematics": loss_kinematics_weight,
+            "charge": loss_charge_weight,
+            "meson_class": loss_meson_class_weight,
+            "consistency": loss_consistency_weight,
+            "charge_count": loss_charge_count_weight,
+            "parent_kinematics": loss_parent_kinematics_weight,
+            "parent_charge": loss_parent_charge_weight,
+            "parent_decay_mode": loss_parent_decay_mode_weight,
+            "soft_parent_kinematics": loss_soft_parent_kinematics_weight,
+            "soft_parent_charge": loss_soft_parent_charge_weight,
+            "soft_parent_decay_mode": loss_soft_parent_decay_mode_weight,
+        }
+        matched_parent_enabled = any(
+            configured_loss_weights[name] > 0
+            for name in (
+                "parent_kinematics",
+                "parent_charge",
+                "parent_decay_mode",
+            )
+        )
+        soft_parent_enabled = any(
+            configured_loss_weights[name] > 0
+            for name in (
+                "soft_parent_kinematics",
+                "soft_parent_charge",
+                "soft_parent_decay_mode",
+            )
+        )
+        if automatic_weight_optimization and not any(
+            weight > 0 for weight in configured_loss_weights.values()
+        ):
+            raise ValueError(
+                "Automatic loss-weight optimization requires at least one positive "
+                "configured loss weight."
+            )
+        if (
+            automatic_weight_optimization
+            and matched_parent_enabled
+            and soft_parent_enabled
+        ):
+            raise ValueError(
+                "Automatic loss-weight optimization supports only one parent "
+                "constraint family at a time. Set either all weight_parent_* or "
+                "all weight_soft_parent_* values to zero."
+            )
+        self.loss_weighting = (
+            HomoscedasticLossWeighting(configured_loss_weights)
+            if automatic_weight_optimization
+            else None
+        )
         if not 0.0 < parent_objectness_temperature < 1.0:
             raise ValueError("parent_objectness_temperature must be between 0 and 1.")
         self.parent_objectness_temperature = parent_objectness_temperature
@@ -1050,6 +1184,44 @@ class SetCriterion(nn.Module):
                 * loss_soft_parent_decay_mode
             )
 
+        if self.loss_weighting is not None:
+            raw_losses = {
+                "objectness": loss_objectness,
+                "tau_id": loss_tau_id,
+                "kinematics": loss_kinematics,
+                "charge": loss_charge,
+                "meson_class": loss_meson_class,
+                "consistency": loss_consistency,
+                "charge_count": loss_charge_count,
+                "parent_kinematics": loss_parent_kinematics,
+                "parent_charge": loss_parent_charge,
+                "parent_decay_mode": loss_parent_decay_mode,
+                "soft_parent_kinematics": loss_soft_parent_kinematics,
+                "soft_parent_charge": loss_soft_parent_charge,
+                "soft_parent_decay_mode": loss_soft_parent_decay_mode,
+            }
+            signal_count = signal_mask.sum()
+            supervision_counts = {
+                "objectness": signal_count,
+                "tau_id": (
+                    batch_size
+                    if "is_tau" in outputs and target_is_tau is not None
+                    else 0
+                ),
+                "kinematics": num_matched,
+                "charge": num_charge_supervised,
+                "meson_class": num_meson_class_supervised,
+                "consistency": signal_count,
+                "charge_count": signal_count,
+                "parent_kinematics": signal_count,
+                "parent_charge": signal_count,
+                "parent_decay_mode": signal_count,
+                "soft_parent_kinematics": signal_count,
+                "soft_parent_charge": signal_count,
+                "soft_parent_decay_mode": signal_count,
+            }
+            total_loss = self.loss_weighting(raw_losses, supervision_counts)
+
         return {
             "loss": total_loss,
             "loss_objectness": loss_objectness,
@@ -1226,6 +1398,9 @@ class ParTauDETRModule(L.LightningModule):
             loss_soft_parent_charge_weight=float(detr_cfg.loss.weight_soft_parent_charge),
             loss_soft_parent_decay_mode_weight=float(detr_cfg.loss.weight_soft_parent_decay_mode),
             parent_objectness_temperature=float(detr_cfg.loss.parent_objectness_temperature),
+            automatic_weight_optimization=bool(
+                detr_cfg.loss.get("automatic_weight_optimization", False)
+            ),
             no_object_class_index=1,
             object_class_index=0,
             eos_coef=float(detr_cfg.loss.eos_coef),
@@ -1331,6 +1506,24 @@ class ParTauDETRModule(L.LightningModule):
         # Best decay-mode accuracy any threshold scan has reached, so a later
         # scan that collapses can be recognised as such; see on_validation_start.
         self._best_scan_accuracy = 0.0
+
+    def _log_automatic_loss_weights(self) -> None:
+        if self.criterion.loss_weighting is None:
+            return
+        effective_weights = self.criterion.loss_weighting.effective_weights()
+        for name, log_variance in self.criterion.loss_weighting.log_variances.items():
+            self.log(
+                f"loss_log_variances/{name}",
+                log_variance.detach(),
+                on_step=False,
+                on_epoch=True,
+            )
+            self.log(
+                f"loss_weights/{name}",
+                effective_weights[name].detach(),
+                on_step=False,
+                on_epoch=True,
+            )
 
     @staticmethod
     def _ohe_to_class_indices(
@@ -1475,6 +1668,7 @@ class ParTauDETRModule(L.LightningModule):
             jet_weights=weights,
             objectness_threshold=self.score_threshold_calibrated,
         )
+        self._log_automatic_loss_weights()
 
         # A non-finite loss must not reach the optimizer: one backward of a NaN
         # writes NaN into every weight, and the run then continues producing
@@ -1995,6 +2189,8 @@ class ParTauDETRModule(L.LightningModule):
         """
         if self.trainer is None:
             return
+        if self.criterion.loss_weighting is not None:
+            self.criterion.loss_weighting.freeze_inactive_log_variances()
         grads = [p.grad for p in self.parameters() if p.grad is not None]
         if grads:
             total = torch.sqrt(
@@ -2173,11 +2369,10 @@ class ParTauDETRModule(L.LightningModule):
         opt_cfg = self.cfg.training.get("optimizer", None) or {}
         weight_decay = float(opt_cfg.get("weight_decay", 1e-2))
 
-        # Two parameter groups. Weight decay is a prior towards zero that makes
-        # sense for weight matrices and none for biases, LayerNorm gains, the
-        # DETR query embeddings or the cls token -- the last two are what
-        # ParTauDETR.no_weight_decay() lists, and until now that method was
-        # defined and never called, so they were decayed like everything else.
+        # Weight decay is a prior towards zero that makes sense for weight
+        # matrices and none for biases, LayerNorm gains, the DETR query
+        # embeddings, the cls token or learned log variances. The latter get an
+        # optional third parameter group when automatic weighting is enabled.
         skip = set(self.ParTauDETR.no_weight_decay())
         decay, no_decay = [], []
         for name, parameter in self.ParTauDETR.named_parameters():
@@ -2187,13 +2382,18 @@ class ParTauDETRModule(L.LightningModule):
                 no_decay.append(parameter)
             else:
                 decay.append(parameter)
-        optimizer = torch.optim.AdamW(
-            [
-                {"params": decay, "weight_decay": weight_decay},
-                {"params": no_decay, "weight_decay": 0.0},
-            ],
-            lr=base_lr,
-        )
+        parameter_groups = [
+            {"params": decay, "weight_decay": weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ]
+        if self.criterion.loss_weighting is not None:
+            parameter_groups.append(
+                {
+                    "params": self.criterion.loss_weighting.parameters(),
+                    "weight_decay": 0.0,
+                }
+            )
+        optimizer = torch.optim.AdamW(parameter_groups, lr=base_lr)
 
         estimated_steps = getattr(self.trainer, "estimated_stepping_batches", None)
         if estimated_steps is None or estimated_steps <= 0:

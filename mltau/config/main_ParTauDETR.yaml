@@ -124,13 +124,19 @@ model:
             classification_cost: clipped_nll
             classification_cost_clip: 5.0
         loss:
+            # Learn homoscedastic task uncertainties for every loss below whose
+            # configured weight is positive. The configured value initializes
+            # the effective coefficient, so enabling this starts from the same
+            # model gradients as the fixed-weight objective. At most one of the
+            # matched-query and soft parent-constraint families may be active.
+            automatic_weight_optimization: true
             weight_objectness: 1.0
             weight_tau_id: 1.0
             weight_kinematics: 5.0
             weight_charge: 1.0
             weight_meson_class: 1.0
-            weight_consistency: 0.1
-            weight_charge_count: 0.1
+            weight_consistency: 1.0
+            weight_charge_count: 0.0
             weight_parent_kinematics: 0.0
             weight_parent_charge: 0.0
             weight_parent_decay_mode: 0.0
@@ -139,9 +145,9 @@ model:
             # sharpened around the calibrated inference threshold t as
             # sigmoid((logit(p) - logit(t)) / temperature). Keep the temperature
             # between 0 and 1.
-            weight_soft_parent_kinematics: 0.0
-            weight_soft_parent_charge: 0.0
-            weight_soft_parent_decay_mode: 0.0
+            weight_soft_parent_kinematics: 1.0
+            weight_soft_parent_charge: 1.0
+            weight_soft_parent_decay_mode: 1.0
             parent_objectness_temperature: 0.1
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
