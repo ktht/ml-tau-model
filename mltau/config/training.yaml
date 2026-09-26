@@ -143,6 +143,11 @@ training:
         # (training_step's non-finite counter, EarlyStopping) still cover the
         # window. 0 disables the grace and arms the guard from step 0.
         grad_skip_warmup_steps: 500
+        # Exact per-loss gradient norms and pairwise cosine similarities require
+        # one extra autograd traversal and one retained gradient copy per enabled
+        # loss. Sample them sparsely; 0 disables these diagnostics. The cheap
+        # combined grad/total_norm remains logged every optimizer step.
+        per_loss_gradient_log_every_n_steps: 100
 
     dataloader:
         batch_size: 12288

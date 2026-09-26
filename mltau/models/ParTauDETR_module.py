@@ -1540,6 +1540,13 @@ class ParTauDETRModule(L.LightningModule):
         self.grad_skip_warmup_steps = int(
             _opt_cfg.get("grad_skip_warmup_steps", 500)
         )
+        self.per_loss_gradient_log_every_n_steps = int(
+            _opt_cfg.get("per_loss_gradient_log_every_n_steps", 100)
+        )
+        if self.per_loss_gradient_log_every_n_steps < 0:
+            raise ValueError(
+                "optimizer.per_loss_gradient_log_every_n_steps must be non-negative."
+            )
         self.grad_clip_val = float(_trainer_cfg.get("gradient_clip_val", 1.0))
         self._consecutive_skips = 0
         # One warning per run for the start-up transient, not one per step.
@@ -1567,7 +1574,7 @@ class ParTauDETRModule(L.LightningModule):
                 on_epoch=True,
             )
 
-    def _log_per_loss_gradient_norms(
+    def _log_per_loss_gradient_diagnostics(
         self, losses: dict[str, torch.Tensor]
     ) -> None:
         parameters = tuple(
@@ -1575,9 +1582,12 @@ class ParTauDETRModule(L.LightningModule):
             for parameter in self.ParTauDETR.parameters()
             if parameter.requires_grad
         )
+        loss_gradients: dict[str, tuple[torch.Tensor | None, ...]] = {}
+        loss_norms: dict[str, torch.Tensor] = {}
         for key, weighted_loss in losses.items():
             if not key.startswith("weighted_loss/"):
                 continue
+            name = key.removeprefix("weighted_loss/")
             if weighted_loss.requires_grad:
                 gradients = torch.autograd.grad(
                     weighted_loss,
@@ -1595,15 +1605,46 @@ class ParTauDETRModule(L.LightningModule):
                     if squared_norms
                     else weighted_loss.new_zeros(())
                 )
+                loss_gradients[name] = tuple(
+                    gradient.detach().float() if gradient is not None else None
+                    for gradient in gradients
+                )
             else:
                 norm = weighted_loss.new_zeros(())
-            name = key.removeprefix("weighted_loss/")
+                loss_gradients[name] = tuple(None for _ in parameters)
+            loss_norms[name] = norm
             self.log(
                 f"grad/loss_norm/{name}",
                 norm,
                 on_step=True,
                 on_epoch=False,
             )
+
+        names = list(loss_gradients)
+        for left_index, left_name in enumerate(names):
+            for right_name in names[left_index + 1 :]:
+                dot_terms = [
+                    (left * right).sum()
+                    for left, right in zip(
+                        loss_gradients[left_name], loss_gradients[right_name]
+                    )
+                    if left is not None and right is not None
+                ]
+                denominator = loss_norms[left_name] * loss_norms[right_name]
+                if dot_terms:
+                    cosine = torch.where(
+                        denominator > 0,
+                        torch.stack(dot_terms).sum() / denominator.clamp_min(1e-30),
+                        denominator.new_full((), float("nan")),
+                    )
+                else:
+                    cosine = denominator.new_full((), float("nan"))
+                self.log(
+                    f"grad/loss_cosine/{left_name}__{right_name}",
+                    cosine,
+                    on_step=True,
+                    on_epoch=False,
+                )
 
     @staticmethod
     def _ohe_to_class_indices(
@@ -1769,7 +1810,9 @@ class ParTauDETRModule(L.LightningModule):
                 self.trainer.should_stop = True
             return None
         self._non_finite_steps = 0
-        self._log_per_loss_gradient_norms(losses)
+        gradient_log_interval = self.per_loss_gradient_log_every_n_steps
+        if gradient_log_interval > 0 and self.global_step % gradient_log_interval == 0:
+            self._log_per_loss_gradient_diagnostics(losses)
 
         self.log("train_losses/loss", losses["loss"], on_step=False, on_epoch=True)
         self.log(
