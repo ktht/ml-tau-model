@@ -2289,6 +2289,18 @@ class ParTauDETRModule(L.LightningModule):
             return
         if self.criterion.loss_weighting is not None:
             self.criterion.loss_weighting.freeze_inactive_log_variances()
+            for name, log_variance in (
+                self.criterion.loss_weighting.log_variances.items()
+            ):
+                if log_variance.grad is not None:
+                    # Signed: positive lowers s and raises w under gradient
+                    # descent; negative raises s and lowers w.
+                    self.log(
+                        f"grad/log_variance/{name}",
+                        log_variance.grad.detach(),
+                        on_step=True,
+                        on_epoch=False,
+                    )
         grads = [p.grad for p in self.parameters() if p.grad is not None]
         if grads:
             total = torch.sqrt(
