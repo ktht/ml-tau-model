@@ -370,7 +370,7 @@ def calculate_metrics(matches, target_meson_class, pred_meson_class):
     )
 
 
-def model_inference(checkpoint_path, data_path, cfg):
+def load_model(checkpoint_path, cfg):
     model = ParTauDETRModule.load_from_checkpoint(
         checkpoint_path=checkpoint_path,
         map_location=DEVICE,
@@ -378,6 +378,12 @@ def model_inference(checkpoint_path, data_path, cfg):
     )
     model.to(DEVICE)
     model.eval()
+    return model
+
+
+def model_inference(checkpoint_path, data_path, cfg, model=None):
+    if model is None:
+        model = load_model(checkpoint_path, cfg)
     data_paths = [data_path] if isinstance(data_path, (str, bytes)) else data_path
     data = ak.concatenate([ak.from_parquet(path) for path in data_paths])
     print(f"Read {len(data):,} jets from {len(data_paths)} parquet files.", flush=True)

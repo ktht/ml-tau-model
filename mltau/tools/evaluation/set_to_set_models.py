@@ -86,7 +86,12 @@ def construct_jet_level_predictions(
 
 
 def construct_prediction_file_content(
-    data, pred_daughters, true_daughters, tau_daughter_pdg_ids, debug = False,
+    data,
+    pred_daughters,
+    true_daughters,
+    tau_daughter_pdg_ids,
+    tau_tagging_score=None,
+    debug=False,
 ):
     fields_of_interest = [
         "reco_jet_p4",
@@ -119,15 +124,30 @@ def construct_prediction_file_content(
     pred_tau_jet_level_data = construct_jet_level_predictions(
         pred_daughters, true_daughters, tau_daughter_pdg_ids
     )
-    combined_data = ak.zip(
+    output_fields = {
+        **{f: data_of_interest[f] for f in ak.fields(data_of_interest)},
+        **{f: pred_tau_daughter_data[f] for f in ak.fields(pred_tau_daughter_data)},
+        **{
+            f: pred_tau_jet_level_data[f]
+            for f in ak.fields(pred_tau_jet_level_data)
+        },
+    }
+    if tau_tagging_score is not None:
+        output_fields["tau_tagging_score"] = tau_tagging_score
+    combined_data = ak.zip(output_fields, depth_limit=1)
+    return combined_data
+
+
+def construct_background_prediction_file_content(data, tau_tagging_score):
+    """Build the minimal jet-level output for a background sample."""
+    fields_of_interest = ["reco_jet_p4", "gen_jet_p4"]
+    fields_of_interest.extend(
+        field for field in ("file_id", "event_id") if field in ak.fields(data)
+    )
+    return ak.zip(
         {
-            **{f: data_of_interest[f] for f in ak.fields(data_of_interest)},
-            **{f: pred_tau_daughter_data[f] for f in ak.fields(pred_tau_daughter_data)},
-            **{
-                f: pred_tau_jet_level_data[f]
-                for f in ak.fields(pred_tau_jet_level_data)
-            },
+            **{field: data[field] for field in fields_of_interest},
+            "tau_tagging_score": tau_tagging_score,
         },
         depth_limit=1,
     )
-    return combined_data
