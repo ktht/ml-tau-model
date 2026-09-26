@@ -111,24 +111,42 @@ CLASSIFICATION_COSTS = ("prob", "nll", "clipped_nll")
 class HomoscedasticLossWeighting(nn.Module):
     """Learn task weights through homoscedastic log variances."""
 
-    def __init__(self, initial_weights: dict[str, float]):
+    def __init__(
+        self,
+        initial_weights: dict[str, float],
+        priorities: dict[str, float] | None = None,
+    ):
         super().__init__()
         # Inspired by Kendall et al., arXiv:1705.07115, with s = log(sigma^2).
         # Their regression factor 0.5 only shifts s by a constant and does not
         # change optimization of the effective weight, so all terms use exp(-s).
-        # Each task contributes exp(-s) * L + 0.5 * s, with effective weight
-        # w = exp(-s). Its gradient is d/ds = 0.5 - w * L: when w * L > 0.5,
-        # gradient descent increases s and lowers w; when w * L < 0.5, it lowers
-        # s and raises w. Thus each task independently moves towards w * L = 0.5.
+        # Each task contributes exp(-s) * L + 0.5 * c * s, with effective
+        # weight w = exp(-s) and configured priority c. Its gradient is
+        # d/ds = 0.5*c - w*L, so each task independently moves towards
+        # w*L = 0.5*c. The default c=1 recovers the paper-inspired balance.
         #
         # This balances loss magnitudes, not necessarily gradient magnitudes or
         # downstream performance: tasks still interact through the shared model
-        # parameters. The +0.5*s term prevents every w simply collapsing to zero.
+        # parameters. The +0.5*c*s term prevents every w collapsing to zero.
         self.log_variances = nn.ParameterDict()
         self._active_terms: dict[str, torch.Tensor] = {}
+        priorities = priorities or {}
+        unknown_priorities = priorities.keys() - initial_weights.keys()
+        if unknown_priorities:
+            raise ValueError(
+                "Automatic loss-weight priorities contain unknown terms: "
+                f"{sorted(unknown_priorities)}"
+            )
+        self.priorities: dict[str, float] = {}
         for name, weight in initial_weights.items():
             if weight <= 0:
                 continue
+            priority = float(priorities.get(name, 1.0))
+            if priority <= 0:
+                raise ValueError(
+                    f"Automatic loss-weight priority for {name!r} must be positive."
+                )
+            self.priorities[name] = priority
             # Choose s so exp(-s) equals the configured initial weight.
             initial_log_variance = -math.log(weight)
             self.log_variances[name] = nn.Parameter(
@@ -172,10 +190,10 @@ class HomoscedasticLossWeighting(nn.Module):
                 log_variance,
                 log_variance.detach(),
             )
-            # The 0.5 * s term prevents the learned weight collapsing to zero.
+            # The 0.5*c*s term prevents the learned weight collapsing to zero.
             total = total + is_supervised * (
                 torch.exp(-active_log_variance) * losses[name]
-                + 0.5 * active_log_variance
+                + 0.5 * self.priorities[name] * active_log_variance
             )
         return total
 
@@ -497,6 +515,7 @@ class SetCriterion(nn.Module):
         loss_soft_parent_decay_mode_weight: float = 0.0,
         parent_objectness_temperature: float = 0.1,
         automatic_weight_optimization: bool = False,
+        automatic_weight_priorities: dict[str, float] | None = None,
         no_object_class_index: int = 1,
         object_class_index: int = 0,
         eos_coef: float = 0.1,
@@ -533,6 +552,7 @@ class SetCriterion(nn.Module):
             "soft_parent_charge": loss_soft_parent_charge_weight,
             "soft_parent_decay_mode": loss_soft_parent_decay_mode_weight,
         }
+        self.configured_loss_weights = configured_loss_weights
         matched_parent_enabled = any(
             configured_loss_weights[name] > 0
             for name in (
@@ -567,7 +587,10 @@ class SetCriterion(nn.Module):
                 "all weight_soft_parent_* values to zero."
             )
         self.loss_weighting = (
-            HomoscedasticLossWeighting(configured_loss_weights)
+            HomoscedasticLossWeighting(
+                configured_loss_weights,
+                priorities=automatic_weight_priorities,
+            )
             if automatic_weight_optimization
             else None
         )
@@ -1184,22 +1207,22 @@ class SetCriterion(nn.Module):
                 * loss_soft_parent_decay_mode
             )
 
+        raw_losses = {
+            "objectness": loss_objectness,
+            "tau_id": loss_tau_id,
+            "kinematics": loss_kinematics,
+            "charge": loss_charge,
+            "meson_class": loss_meson_class,
+            "consistency": loss_consistency,
+            "charge_count": loss_charge_count,
+            "parent_kinematics": loss_parent_kinematics,
+            "parent_charge": loss_parent_charge,
+            "parent_decay_mode": loss_parent_decay_mode,
+            "soft_parent_kinematics": loss_soft_parent_kinematics,
+            "soft_parent_charge": loss_soft_parent_charge,
+            "soft_parent_decay_mode": loss_soft_parent_decay_mode,
+        }
         if self.loss_weighting is not None:
-            raw_losses = {
-                "objectness": loss_objectness,
-                "tau_id": loss_tau_id,
-                "kinematics": loss_kinematics,
-                "charge": loss_charge,
-                "meson_class": loss_meson_class,
-                "consistency": loss_consistency,
-                "charge_count": loss_charge_count,
-                "parent_kinematics": loss_parent_kinematics,
-                "parent_charge": loss_parent_charge,
-                "parent_decay_mode": loss_parent_decay_mode,
-                "soft_parent_kinematics": loss_soft_parent_kinematics,
-                "soft_parent_charge": loss_soft_parent_charge,
-                "soft_parent_decay_mode": loss_soft_parent_decay_mode,
-            }
             signal_count = signal_mask.sum()
             supervision_counts = {
                 "objectness": signal_count,
@@ -1221,6 +1244,18 @@ class SetCriterion(nn.Module):
                 "soft_parent_decay_mode": signal_count,
             }
             total_loss = self.loss_weighting(raw_losses, supervision_counts)
+            effective_weights = self.loss_weighting.effective_weights()
+        else:
+            effective_weights = {
+                name: raw_losses[name].new_tensor(weight)
+                for name, weight in self.configured_loss_weights.items()
+                if weight > 0
+            }
+
+        weighted_losses = {
+            f"weighted_loss/{name}": effective_weights[name] * raw_losses[name]
+            for name in effective_weights
+        }
 
         return {
             "loss": total_loss,
@@ -1246,6 +1281,7 @@ class SetCriterion(nn.Module):
             "num_meson_class_supervised": num_meson_class_supervised.to(
                 pred_logits.dtype
             ),
+            **weighted_losses,
             **{k: pred_logits.new_tensor(v) for k, v in self.matcher.last_cost_terms.items()},
         }
 
@@ -1401,6 +1437,12 @@ class ParTauDETRModule(L.LightningModule):
             automatic_weight_optimization=bool(
                 detr_cfg.loss.get("automatic_weight_optimization", False)
             ),
+            automatic_weight_priorities={
+                str(name): float(priority)
+                for name, priority in detr_cfg.loss.get(
+                    "automatic_weight_priorities", {}
+                ).items()
+            },
             no_object_class_index=1,
             object_class_index=0,
             eos_coef=float(detr_cfg.loss.eos_coef),
@@ -1523,6 +1565,44 @@ class ParTauDETRModule(L.LightningModule):
                 effective_weights[name].detach(),
                 on_step=False,
                 on_epoch=True,
+            )
+
+    def _log_per_loss_gradient_norms(
+        self, losses: dict[str, torch.Tensor]
+    ) -> None:
+        parameters = tuple(
+            parameter
+            for parameter in self.ParTauDETR.parameters()
+            if parameter.requires_grad
+        )
+        for key, weighted_loss in losses.items():
+            if not key.startswith("weighted_loss/"):
+                continue
+            if weighted_loss.requires_grad:
+                gradients = torch.autograd.grad(
+                    weighted_loss,
+                    parameters,
+                    retain_graph=True,
+                    allow_unused=True,
+                )
+                squared_norms = [
+                    gradient.detach().float().square().sum()
+                    for gradient in gradients
+                    if gradient is not None
+                ]
+                norm = (
+                    torch.stack(squared_norms).sum().sqrt()
+                    if squared_norms
+                    else weighted_loss.new_zeros(())
+                )
+            else:
+                norm = weighted_loss.new_zeros(())
+            name = key.removeprefix("weighted_loss/")
+            self.log(
+                f"grad/loss_norm/{name}",
+                norm,
+                on_step=True,
+                on_epoch=False,
             )
 
     @staticmethod
@@ -1689,6 +1769,7 @@ class ParTauDETRModule(L.LightningModule):
                 self.trainer.should_stop = True
             return None
         self._non_finite_steps = 0
+        self._log_per_loss_gradient_norms(losses)
 
         self.log("train_losses/loss", losses["loss"], on_step=False, on_epoch=True)
         self.log(
@@ -1803,6 +1884,14 @@ class ParTauDETRModule(L.LightningModule):
         for key, value in losses.items():
             if key.startswith("cost/"):
                 self.log(key, value, on_step=False, on_epoch=True)
+            elif key.startswith("weighted_loss/"):
+                name = key.removeprefix("weighted_loss/")
+                self.log(
+                    f"train_weighted_losses/{name}",
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                )
         self.log("counts/num_charge_supervised", losses["num_charge_supervised"],
                  on_step=False, on_epoch=True)
         self.log("counts/num_meson_class_supervised",
@@ -2153,6 +2242,15 @@ class ParTauDETRModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
         )
+        for key, value in losses.items():
+            if key.startswith("weighted_loss/"):
+                name = key.removeprefix("weighted_loss/")
+                self.log(
+                    f"val_weighted_losses/{name}",
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                )
 
         if not self.trainer.sanity_checking:
             self._accumulate_jet_level(batch, outputs, targets)

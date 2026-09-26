@@ -130,6 +130,11 @@ model:
             # model gradients as the fixed-weight objective. At most one of the
             # matched-query and soft parent-constraint families may be active.
             automatic_weight_optimization: true
+            # Optional relative equilibrium priorities c. Every enabled loss
+            # defaults to c = 1 and is driven towards w * L = 0.5 * c. Add only
+            # overrides here; for example, {soft_parent_decay_mode: 2.0} targets
+            # twice the weighted contribution without changing its initial weight.
+            automatic_weight_priorities: {}
             weight_objectness: 1.0
             weight_tau_id: 1.0
             weight_kinematics: 5.0
