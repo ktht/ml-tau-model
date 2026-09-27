@@ -12,7 +12,7 @@ import numpy as np
 from ntupelizer.tools.tau_decaymode import RARE_DECAY_MODE_EXT, classify_decay_modes
 
 from mltau.tools.general import reinitialize_p4
-from mltau.tools.meson_classes import get_meson_classes
+from mltau.tools.meson_classes import CHARGED_HADRON_PDG, NEUTRAL_HADRON_PDG
 
 # The set model predicts meson CLASSES, not species. For the decay mode a class
 # is represented by one hadron that stands for it: any charged hadron for a
@@ -20,34 +20,9 @@ from mltau.tools.meson_classes import get_meson_classes
 # representative ids the ntupelizer writes into gen_jet_tau_vis_daughter_pdgs
 # (map_pdgid_to_candid), and ml-tau-data classifies them by property, so a
 # class and a stored daughter go through the identical code path.
-CHARGED_HADRON_PDG = 211
-NEUTRAL_HADRON_PDG = 130
-
-
-def meson_class_representative_pdgs(tau_daughter_pdg_ids) -> list[int]:
-    """One representative |PDG| per configured meson class, in class order."""
-    representatives = []
-    for meson_class in get_meson_classes(tau_daughter_pdg_ids):
-        charges = set(meson_class.charges)
-        if charges == {0}:
-            representatives.append(NEUTRAL_HADRON_PDG)
-        elif 0 not in charges:
-            representatives.append(CHARGED_HADRON_PDG)
-        else:
-            raise ValueError(
-                f"Meson class '{meson_class.name}' mixes neutral and charged particles."
-            )
-    return representatives
-
-
-def meson_class_to_pdg(meson_class, tau_daughter_pdg_ids):
-    """Jagged meson-class indices -> jagged representative PDG ids."""
-    representatives = np.asarray(
-        meson_class_representative_pdgs(tau_daughter_pdg_ids), dtype=np.int64
-    )
-    counts = ak.num(meson_class, axis=1)
-    flat = ak.to_numpy(ak.flatten(meson_class, axis=1)).astype(np.int64)
-    return ak.unflatten(representatives[flat], counts)
+def charge_to_representative_pdg(charge):
+    """Map neutral daughters to 130 and charged daughters to 211."""
+    return ak.where(charge == 0, NEUTRAL_HADRON_PDG, CHARGED_HADRON_PDG)
 
 
 def get_decay_mode(pdg):
@@ -67,8 +42,8 @@ def get_decay_mode(pdg):
 def construct_jet_level_predictions(
     pred_daughters, true_daughters, tau_daughter_pdg_ids
 ):
-    pred_pdg = meson_class_to_pdg(pred_daughters.meson_class, tau_daughter_pdg_ids)
-    true_pdg = meson_class_to_pdg(true_daughters.meson_class, tau_daughter_pdg_ids)
+    pred_pdg = charge_to_representative_pdg(pred_daughters.charge)
+    true_pdg = charge_to_representative_pdg(true_daughters.charge)
 
     pred_tau_decay_mode = get_decay_mode(pred_pdg)
     pred_tau_p4 = reinitialize_p4(ak.sum(pred_daughters.p4, axis=1))
@@ -86,7 +61,11 @@ def construct_jet_level_predictions(
 
 
 def construct_prediction_file_content(
-    data, pred_daughters, true_daughters, tau_daughter_pdg_ids, debug = False,
+    data,
+    pred_daughters,
+    true_daughters,
+    tau_daughter_pdg_ids,
+    debug=False,
 ):
     fields_of_interest = [
         "reco_jet_p4",
@@ -117,7 +96,9 @@ def construct_prediction_file_content(
         }
     )
     pred_tau_jet_level_data = construct_jet_level_predictions(
-        pred_daughters, true_daughters, tau_daughter_pdg_ids
+        pred_daughters,
+        true_daughters,
+        tau_daughter_pdg_ids,
     )
     combined_data = ak.zip(
         {

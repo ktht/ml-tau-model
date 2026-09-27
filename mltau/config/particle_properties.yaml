@@ -1,0 +1,19 @@
+particle_properties:
+    # Masses are in GeV. charge is absolute not signed electric charge:
+    # 1 means charged and 0 means neutral. Antiparticles use the same entry.
+    #
+    # Mass source: Particle Data Group 2026 summary tables, converted from MeV
+    # to GeV and rounded to the precision shown by PDG:
+    #   https://pdgapi.lbl.gov/summaries/S008  pi+/-
+    #   https://pdgapi.lbl.gov/summaries/S009  pi0
+    #   https://pdgapi.lbl.gov/summaries/S010  K+/-
+    #   https://pdgapi.lbl.gov/summaries/S011  K0
+    #   https://pdgapi.lbl.gov/summaries/S014  eta
+    # These are PDG reference masses, not values extracted from the generator
+    # particle table used to produce the dataset. Replace them if that table
+    # uses different masses.
+    211: {charge: 1, mass: 0.13957039} # pi+/-
+    321: {charge: 1, mass: 0.493677}   # K+/-
+    111: {charge: 0, mass: 0.1349768}  # pi0
+    221: {charge: 0, mass: 0.547862}   # eta
+    130: {charge: 0, mass: 0.497611}   # K_L0

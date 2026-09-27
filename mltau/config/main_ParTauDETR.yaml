@@ -130,6 +130,7 @@ model:
             weight_charge: 1.0
             weight_meson_class: 1.0
             weight_consistency: 0.1
+            weight_mass_consistency: 0.1
             weight_charge_count: 0.1
             weight_parent_kinematics: 0.0
             weight_parent_charge: 0.0
@@ -140,8 +141,8 @@ model:
             # sigmoid((logit(p) - logit(t)) / temperature). Keep the temperature
             # between 0 and 1.
             weight_soft_parent_kinematics: 0.0
-            weight_soft_parent_charge: 0.0
-            weight_soft_parent_decay_mode: 0.0
+            weight_soft_parent_charge: 1.0
+            weight_soft_parent_decay_mode: 1.0
             parent_objectness_temperature: 0.1
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
@@ -160,6 +161,22 @@ model:
             # destroy the decay mode (an extra daughter changes the prong count
             # outright), and it removes a magic number. Re-derive if Q changes.
             eos_coef: 1.0
+        mass:
+            # Let x = log(m_proposal / m_reco_jet) be the fifth model output,
+            # and m_k a configured particle mass. First recover the absolute
+            # proposal m_proposal = exp(x) * m_reco_jet. The probabilities are
+            #   p_k = softmax_k(-0.5 * ((m_proposal - m_k) / mass_width)^2)
+            # and the predicted daughter mass is sum_k(p_k * m_k).
+            #
+            # This predicted mass enters training and matching as follows:
+            #   - training loss: Huber(log(m_pred / m_true), 0), as the
+            #     log_mass component of loss_kinematics;
+            #   - Hungarian matching: abs(log(m_pred / m_true)), as the fifth
+            #     component weighted by matcher.kinematics_component_weights.
+            #
+            # mass_width is in GeV. A smaller value makes the closest mass
+            # options sharper; a larger value mixes nearby options more.
+            mass_width: 0.02
         inference:
             # Starting value and fallback for the objectness threshold. During
             # training it is recalibrated before every validation (see
@@ -173,7 +190,9 @@ model:
             tau_id_threshold: 0.5
 
     tau_loss:
-        l_m: 0.2 # mass-term weight in the kinematics loss
+        # The log_mass entries control both daughter log(m_pred/m_true) and the
+        # parent invariant-mass component.
+        l_m: 0.2
         # Smoothing floors the tagging loss at ~0.199 (minimised at p=0.95) and
         # actively penalises confident predictions, while the other heads are
         # unsmoothed and can reach 0. That inflates tau_id's share of the total
@@ -211,5 +230,6 @@ model:
 defaults:
     - _self_
     - metrics/metrics
+    - particle_properties
     - dataset_ParTauDETR
     - training

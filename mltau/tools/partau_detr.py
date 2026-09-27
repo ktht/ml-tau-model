@@ -3,6 +3,35 @@ import math
 import torch
 
 
+def reference_mass(
+    reference_pt: torch.Tensor,
+    reference_eta: torch.Tensor,
+    reference_energy: torch.Tensor,
+) -> torch.Tensor:
+    """Return invariant mass from a reference object's pt, eta, and energy."""
+    return torch.sqrt(
+        torch.clamp(
+            reference_energy**2
+            - (reference_pt * torch.cosh(reference_eta)) ** 2,
+            min=1e-12,
+        )
+    )
+
+
+def absolute_mass_from_log_ratio(
+    log_mass_ratio: torch.Tensor,
+    reference_mass_value: torch.Tensor,
+    *,
+    clamp_log_ratio: bool = False,
+) -> torch.Tensor:
+    """Convert log(daughter mass / reconstructed jet mass) into GeV."""
+    if clamp_log_ratio:
+        log_mass_ratio = log_mass_ratio.clamp(-5.0, 5.0)
+    while reference_mass_value.ndim < log_mass_ratio.ndim:
+        reference_mass_value = reference_mass_value.unsqueeze(-1)
+    return torch.exp(log_mass_ratio) * reference_mass_value
+
+
 def decode_kinematics(
     kinematics: torch.Tensor,
     reference_pt: torch.Tensor,
@@ -32,18 +61,13 @@ def decode_kinematics(
     reference_eta = expand_reference(reference_eta)
     reference_phi = expand_reference(reference_phi)
     reference_energy = expand_reference(reference_energy)
-
-    reference_mass = torch.sqrt(
-        torch.clamp(
-            reference_energy**2 - (reference_pt * torch.cosh(reference_eta)) ** 2,
-            min=1e-12,
-        )
+    reference_mass_value = reference_mass(
+        reference_pt, reference_eta, reference_energy
     )
+
     log_pt_ratio = kinematics[..., 0]
-    log_mass_ratio = kinematics[..., 4]
     if clamp_log_ratios:
         log_pt_ratio = log_pt_ratio.clamp(-5.0, 5.0)
-        log_mass_ratio = log_mass_ratio.clamp(-5.0, 5.0)
 
     pt = torch.exp(log_pt_ratio) * reference_pt
     eta = kinematics[..., 1] + reference_eta
@@ -51,7 +75,11 @@ def decode_kinematics(
         max_abs_eta = math.acosh(math.sqrt(torch.finfo(kinematics.dtype).max))
         eta = eta.clamp(-max_abs_eta, max_abs_eta)
     phi = reference_phi + torch.atan2(kinematics[..., 2], kinematics[..., 3])
-    mass = torch.exp(log_mass_ratio) * reference_mass
+    mass = absolute_mass_from_log_ratio(
+        kinematics[..., 4],
+        reference_mass_value,
+        clamp_log_ratio=clamp_log_ratios,
+    )
 
     return torch.stack(
         [

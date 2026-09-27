@@ -20,15 +20,11 @@ dataset:
     data_dir: /scratch/persistent/karl/ml-tau/0921_ParTauDETR_dataset/
 
     # Meson classes for daughter one-hot encoding. Mapping order defines class
-    # indices and charges defines valid charge-head combinations. All unlisted
-    # decay products are discarded before target padding/truncation.
+    # indices. Particle charge and mass live in particle_properties.yaml.
+    # All unlisted decay products are discarded before target padding/truncation.
     tau_daughter_pdg_ids:
-        charged:
-            pdg_ids: [211, 321] # pi+/-, K+/-
-            charges: [-1, 1]
-        neutral:
-            pdg_ids: [111, 221, 130] # pi0, eta -> yy, K_L0
-            charges: [0]
+        charged: [211, 321] # pi+/-, K+/-
+        neutral: [111, 221, 130] # pi0, eta -> yy, K_L0
 
     # Cap how many jets each sample contributes to train+val. Keys are the
     # filename prefixes before "_train" (e.g. z_train_0003.parquet -> "z").
