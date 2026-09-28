@@ -2,17 +2,14 @@ import awkward as ak
 import numpy as np
 import torch
 from omegaconf import DictConfig
+from ntupelizer.tools.tau_decaymode import classify_decay_modes
 
 from mltau.tools.io.ParT_dataloader import (
     ParTDataModule,
     ParticleTransformerDataset,
-    has_p4_field,
     p4_field,
+    sample_name,
     sort_candidates_by_pt,
-)
-from mltau.tools.meson_classes import (
-    get_meson_class_groups,
-    pdg_to_meson_class_indices,
 )
 
 
@@ -27,10 +24,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
     Targets are replaced with daughter-level set targets:
       - particles_mask: [N, T] (True for valid daughter)
-      - particles_kinematics: [N, T, 5] =
-          [log(pt_dau/pt_jet), delta_eta(dau-jet), sin(delta_phi), cos(delta_phi), log(m_dau/m_jet)]
+      - particles_kinematics: [N, T, 4] =
+          [log(pt_dau/pt_jet), delta_eta(dau-jet), sin(delta_phi), cos(delta_phi)]
       - particles_charge_ohe: [N, T, 3] one-hot for charges [-1, 0, +1]
-      - particles_meson_class_ohe: [N, T, C] one-hot over configured meson classes
 
     where T = cfg.dataset.max_tau_daughters if provided, otherwise inferred from
     the currently loaded row-group.
@@ -61,15 +57,61 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     CHARGE_CLASS_VALUES = [-1, 0, 1]
     CHARGE_TO_CLASS = {q: i for i, q in enumerate(CHARGE_CLASS_VALUES)}
 
-    @property
-    def pdg_class_groups(self) -> tuple[tuple[int, ...], ...]:
-        """Absolute PDG IDs grouped in configured class order."""
-        return get_meson_class_groups(self.cfg.dataset.tau_daughter_pdg_ids)
+    _FILTER_COLUMNS = [
+        "gen_jet_tau_vis_daughter_p4s",
+        "gen_jet_tau_vis_daughter_pdgs",
+        "gen_jet_tau_vis_daughter_charges",
+        "gen_jet_tau_decaymode",
+        "gen_jet_tau_charge",
+    ]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.row_groups and (
+            self.cfg.dataset.get("pion_filter", False)
+            or self.cfg.dataset.get("quality_cuts", False)
+        ):
+            counted_units = []
+            for filename, indices, _ in self.read_units:
+                data = ak.from_parquet(
+                    filename, row_groups=indices, columns=self._FILTER_COLUMNS
+                )
+                n_kept = int(ak.sum(self._selected_jets(data)))
+                if n_kept:
+                    counted_units.append((filename, indices, n_kept))
+            self.read_units = counted_units
+            self.num_rows = sum(unit[2] for unit in counted_units)
+            self.reads_by_sample = {}
+            for unit in counted_units:
+                self.reads_by_sample.setdefault(sample_name(unit[0]), []).append(unit)
 
+    def _acceptance_mask(self, data: ak.Array):
+        daughters = data.gen_jet_tau_vis_daughter_p4s
+        if not self.cfg.dataset.get("quality_cuts", False) or not daughters.fields:
+            return ak.ones_like(data.gen_jet_tau_vis_daughter_pdgs, dtype=bool)
+        pt = p4_field(daughters, "pt")
+        eta = p4_field(daughters, "eta")
+        return (pt > float(self.cfg.dataset.tau_daughter_pt_cut)) & (
+            abs(np.tanh(eta)) < float(self.cfg.dataset.tau_daughter_max_abs_cos_theta)
+        )
 
-
-
+    def _selected_jets(self, data: ak.Array):
+        signal = data.gen_jet_tau_decaymode != -1
+        pdgs = data.gen_jet_tau_vis_daughter_pdgs
+        selected = ak.ones_like(signal, dtype=bool)
+        if self.cfg.dataset.get("pion_filter", False):
+            all_pions = (abs(pdgs) == 211) | (abs(pdgs) == 111)
+            selected = selected & (~signal | (ak.all(all_pions, axis=1) & ak.any(all_pions, axis=1)))
+        if self.cfg.dataset.get("quality_cuts", False):
+            accepted = self._acceptance_mask(data)
+            surviving_pdgs = pdgs[accepted][signal]
+            surviving_charges = data.gen_jet_tau_vis_daughter_charges[accepted][signal]
+            charge_ok = ak.sum(surviving_charges, axis=1) == data.gen_jet_tau_charge[signal]
+            decay_ok = ak.Array(classify_decay_modes(surviving_pdgs)) == data.gen_jet_tau_decaymode[signal]
+            keep = ak.to_numpy(selected)
+            keep[ak.to_numpy(signal)] &= ak.to_numpy(charge_ok & decay_ok)
+            selected = ak.Array(keep)
+        return selected
 
 
     @staticmethod
@@ -109,12 +151,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             out[q == val] = idx
         return out
 
-    def _pdg_to_meson_class_indices(self, raw_pdg: np.ndarray) -> np.ndarray:
-        return pdg_to_meson_class_indices(
-            raw_pdg, self.cfg.dataset.tau_daughter_pdg_ids
-        )
-
     def build_tensors(self, data: ak.Array):
+        if self.cfg.dataset.get("pion_filter", False) or self.cfg.dataset.get("quality_cuts", False):
+            data = data[self._selected_jets(data)]
         if self.cfg.dataset.get("sort_by_pt", False):
             data = sort_candidates_by_pt(data)
         # -------------------------
@@ -225,25 +264,11 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
         daughter_charge_jag = data.gen_jet_tau_vis_daughter_charges
 
-        daughter_pt_cut = float(self.cfg.dataset.get("tau_daughter_pt_cut", -1.0))
-        if daughter_pt_cut >= 0.0 and len(daughter_p4.fields) > 0:
-            daughter_pt = self._get_record_field(daughter_p4, ["pt", "rho"])
-            passes_pt_cut = daughter_pt >= daughter_pt_cut
-            daughter_p4 = daughter_p4[passes_pt_cut]
-            daughter_pdg_jag = daughter_pdg_jag[passes_pt_cut]
-            daughter_charge_jag = daughter_charge_jag[passes_pt_cut]
-
-        daughter_pdg_abs = abs(daughter_pdg_jag)
-        supported_ids = [
-            pdg_id for pdg_ids in self.pdg_class_groups for pdg_id in pdg_ids
-        ]
-        supported_pdg = daughter_pdg_abs == supported_ids[0]
-        for pdg_id in supported_ids[1:]:
-            supported_pdg = supported_pdg | (daughter_pdg_abs == pdg_id)
-
-        daughter_p4 = daughter_p4[supported_pdg]
-        daughter_pdg_jag = daughter_pdg_jag[supported_pdg]
-        daughter_charge_jag = daughter_charge_jag[supported_pdg]
+        if self.cfg.dataset.get("quality_cuts", False) and len(daughter_p4.fields) > 0:
+            accepted = self._acceptance_mask(data)
+            daughter_p4 = daughter_p4[accepted]
+            daughter_pdg_jag = daughter_pdg_jag[accepted]
+            daughter_charge_jag = daughter_charge_jag[accepted]
 
         daughter_p4, daughter_pdg_jag, daughter_charge_jag = (
             self._sort_tau_daughters_by_pt(
@@ -278,22 +303,6 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 dtype=np.float32,
             )
 
-            # p4_field derives energy from any complete basis, including a
-            # (pt, eta, phi, mass) record. What it cannot do is invent a fourth
-            # coordinate, so a record carrying neither energy nor mass is the
-            # one case left to handle here: treat those daughters as massless.
-            if has_p4_field(daughter_p4, "energy") or has_p4_field(
-                daughter_p4, "mass"
-            ):
-                dau_energy = self._pad_jagged(
-                    p4_field(daughter_p4, "energy"),
-                    max_tau_daughters,
-                    fill=0.0,
-                    dtype=np.float32,
-                )
-            else:
-                dau_energy = dau_pt * np.cosh(dau_eta)
-
             daughter_charge = self._pad_jagged(
                 daughter_charge_jag,
                 max_tau_daughters,
@@ -312,20 +321,11 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 np.arange(max_tau_daughters)[None, :] < clipped_counts[:, None]
             )
 
-            dau_px = dau_pt * np.cos(dau_phi)
-            dau_py = dau_pt * np.sin(dau_phi)
-            dau_pz = dau_pt * np.sinh(dau_eta)
-            daughter_p4_np = np.stack([dau_px, dau_py, dau_pz, dau_energy], axis=-1)
-
             # Daughter kinematic targets in the same spirit as ParT kinematics_tensor.
             _LOG_CLAMP = 5.0
             jet_pt_2d = np.maximum(jet_pt[:, None], eps)
             jet_eta_2d = jet_eta[:, None]
             jet_phi_2d = jet_phi[:, None]
-            jet_mass = np.sqrt(
-                np.maximum(jet_en**2 - (jet_pt * np.cosh(jet_eta)) ** 2, 0.0)
-            )
-            jet_mass_2d = np.maximum(jet_mass[:, None], eps)
 
             daughter_deta = dau_eta - jet_eta_2d
             daughter_dphi_raw = dau_phi - jet_phi_2d
@@ -335,27 +335,16 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             daughter_log_pt_ratio = np.clip(
                 np.log(np.maximum(dau_pt / jet_pt_2d, eps)), -_LOG_CLAMP, _LOG_CLAMP
             )
-            daughter_mass = np.sqrt(
-                np.maximum(dau_energy**2 - (dau_pt * np.cosh(dau_eta)) ** 2, 0.0)
-            )
-            daughter_log_mass_ratio = np.clip(
-                np.log(np.maximum(daughter_mass / jet_mass_2d, eps)),
-                -_LOG_CLAMP,
-                _LOG_CLAMP,
-            )
-
             daughter_kinematics_np = np.stack(
                 [
                     daughter_log_pt_ratio,
                     daughter_deta,
                     np.sin(daughter_dphi),
                     np.cos(daughter_dphi),
-                    daughter_log_mass_ratio,
                 ],
                 axis=-1,
             )
 
-            daughter_p4_np *= daughter_mask_np[..., None]
             daughter_kinematics_np *= daughter_mask_np[..., None]
             np.nan_to_num(
                 daughter_kinematics_np, copy=False, nan=0.0, posinf=0.0, neginf=0.0
@@ -370,40 +359,28 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             n_jets = len(data)
             n_slots = max(int(max_tau_daughters), 0)
             daughter_mask_np = np.zeros((n_jets, n_slots), dtype=bool)
-            daughter_p4_np = np.zeros((n_jets, n_slots, 4), dtype=np.float32)
-            daughter_kinematics_np = np.zeros((n_jets, n_slots, 5), dtype=np.float32)
+            daughter_kinematics_np = np.zeros((n_jets, n_slots, 4), dtype=np.float32)
             daughter_charge = np.zeros((n_jets, n_slots), dtype=np.int64)
             daughter_pdg = np.zeros((n_jets, n_slots), dtype=np.int64)
 
         charge_cls = self._charges_to_class_indices(daughter_charge)
-        meson_class = self._pdg_to_meson_class_indices(daughter_pdg)
 
         # Prepare one-hot targets; unknown classes stay all-zero.
         n_charge = len(self.CHARGE_CLASS_VALUES)
-        n_meson_classes = len(self.pdg_class_groups)
         charge_ohe = np.zeros((*charge_cls.shape, n_charge), dtype=np.float32)
-        meson_class_ohe = np.zeros(
-            (*meson_class.shape, n_meson_classes), dtype=np.float32
-        )
 
         valid_charge = charge_cls >= 0
-        valid_meson_class = meson_class >= 0
         if np.any(valid_charge):
             rows, cols = np.where(valid_charge)
             charge_ohe[rows, cols, charge_cls[rows, cols]] = 1.0
-        if np.any(valid_meson_class):
-            rows, cols = np.where(valid_meson_class)
-            meson_class_ohe[rows, cols, meson_class[rows, cols]] = 1.0
 
         # Zero out padded daughters in one-hot tensors too.
         charge_ohe *= daughter_mask_np[..., None]
-        meson_class_ohe *= daughter_mask_np[..., None]
 
         targets = {
             "particles_mask": torch.from_numpy(daughter_mask_np).bool(),
             "particles_kinematics": torch.from_numpy(daughter_kinematics_np).float(),
             "particles_charge_ohe": torch.from_numpy(charge_ohe).float(),
-            "particles_meson_class_ohe": torch.from_numpy(meson_class_ohe).float(),
             # Jet-level tau-tagging label, following ParticleTransformerDataset:
             # -1 -> no genuine tau (background), >= 0 -> genuine tau (signal).
             "is_tau": torch.from_numpy(

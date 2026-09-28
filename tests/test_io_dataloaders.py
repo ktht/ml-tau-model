@@ -21,6 +21,8 @@ import sys
 from pathlib import Path
 
 import awkward as ak
+import numpy as np
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -118,6 +120,54 @@ def check_tau_daughter_sorting():
     assert ParticleTransformerDETRDataset._pad_jagged(
         sorted_charge, 2
     ).tolist() == [[0, 1]]
+
+
+def test_pion_filter_precedes_acceptance_and_preserves_background(monkeypatch):
+    from mltau.tools.io import ParTauDETR_dataloader as detr_loader
+
+    def decay_modes(pdgs):
+        charged = ak.sum(abs(pdgs) == 211, axis=1)
+        neutral = ak.sum(abs(pdgs) == 111, axis=1)
+        return ak.to_numpy(ak.where(charged == 1, neutral, 15))
+
+    monkeypatch.setattr(detr_loader, "classify_decay_modes", decay_modes)
+    data = ak.Array({
+        "gen_jet_tau_decaymode": [0, 0, 1, 1, -1, 0],
+        "gen_jet_tau_charge": [2, 1, 1, 1, 0, 1],
+        "gen_jet_tau_vis_daughter_pdgs": [[211, 321], [211], [211, 111], [211], [], [211, 22]],
+        "gen_jet_tau_vis_daughter_charges": [[1, 1], [1], [1, 0], [1], [], [1, 0]],
+        "gen_jet_tau_vis_daughter_p4s": [
+            [{"pt": 1.0, "eta": 0.0}, {"pt": 0.01, "eta": 0.0}],
+            [{"pt": 1.0, "eta": 0.0}],
+            [{"pt": 1.0, "eta": 0.0}, {"pt": 0.01, "eta": 0.0}],
+            [{"pt": 1.0, "eta": 4.0}],
+            [],
+            [{"pt": 1.0, "eta": 0.0}, {"pt": 1.0, "eta": 0.0}],
+        ],
+    })
+    cfg = compose("main_ParTauDETR.yaml", "dataset_ParTauDETR.yaml", 4)
+    dataset = ParticleTransformerDETRDataset(row_groups=[], cfg=cfg)
+    assert ak.to_list(dataset._selected_jets(data)) == [False, True, False, False, True, False]
+
+    cfg.dataset.pion_filter = False
+    assert ak.to_list(dataset._selected_jets(data)) == [False, True, False, False, True, True]
+    cfg.dataset.quality_cuts = False
+    assert ak.to_list(dataset._selected_jets(data)) == [True] * 6
+    cfg.dataset.pion_filter = True
+    assert ak.to_list(dataset._selected_jets(data)) == [False, True, True, True, True, False]
+
+
+def test_pion_shell_decoder_has_four_component_input():
+    from mltau.tools.partau_detr import PION_MASS_GEV, decode_kinematics
+
+    kinematics = torch.tensor([[[0.0, 0.0, 0.0, 1.0]]])
+    reference = torch.tensor([1.0])
+    decoded = decode_kinematics(
+        kinematics, reference, reference * 0, reference * 0,
+        reference * 2,
+    )
+    assert decoded.shape == (1, 1, 4)
+    assert decoded[0, 0, 3].item() == pytest.approx(np.sqrt(1 + PION_MASS_GEV**2))
 
 
 def run(main: str, dataset: str, module_cls, label: str, batch_size: int = 256):

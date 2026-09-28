@@ -8,27 +8,13 @@ dataset:
     # not a requirement. Fewer queries make each one count more; see
     # model.detr.loss.eos_coef before changing this.
     max_tau_daughters: 5
-     # Negative value disables the pT cut
-     # NB! When enabling the cut, the charge, DM and 4-momentum that is
-     # obtained by aggregating generator-level constituents passing the pT
-     # cut might differ from the charge, DM and 4-momentum of the visible
-     # generator-level tau that's stored in the dataset. The correct solution
-     # would be to rederive the target charge, DM and 4-momentum of the visible
-     # generator-level tau after the pT cut. Note that this is only an issue if
-     # the pT cut is enabled and weight_parent_* weights are positive.
-    tau_daughter_pt_cut: -1.0
+    # Apply to signal taus before constructing daughter targets. The pion
+    # filter checks the original daughter list, before acceptance cuts.
+    pion_filter: true
+    quality_cuts: true
+    tau_daughter_pt_cut: 0.1
+    tau_daughter_max_abs_cos_theta: 0.99
     data_dir: /scratch/persistent/karl/ml-tau/0921_ParTauDETR_dataset/
-
-    # Meson classes for daughter one-hot encoding. Mapping order defines class
-    # indices and charges defines valid charge-head combinations. All unlisted
-    # decay products are discarded before target padding/truncation.
-    tau_daughter_pdg_ids:
-        charged:
-            pdg_ids: [211, 321] # pi+/-, K+/-
-            charges: [-1, 1]
-        neutral:
-            pdg_ids: [111, 221, 130] # pi0, eta -> yy, K_L0
-            charges: [0]
 
     # Cap how many jets each sample contributes to train+val. Keys are the
     # filename prefixes before "_train" (e.g. z_train_0003.parquet -> "z").

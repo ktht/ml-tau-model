@@ -117,7 +117,7 @@ def _predicted_components(outputs, reco_jet_p4s):
     charge_lut = outputs["pred_charge_logits"].new_tensor([-1, 0, 1], dtype=torch.long)
     pred_charge = charge_lut[pred_charge_cls]
 
-    pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
+    pred_meson_class = (pred_charge == 0).long()
 
     pred_p4_tensor = decode_kinematics_p4(
         outputs["pred_kinematics"],
@@ -177,7 +177,7 @@ def get_true_particles(targets, reco_jet_p4s):
     target_charge = charge_lut[target_charge_cls]
     target_charge = ak.drop_none(ak.mask(target_charge, target_mask))
 
-    target_meson_class = targets["particles_meson_class_ohe"].argmax(dim=-1)
+    target_meson_class = (charge_lut[target_charge_cls] == 0).long()
     target_meson_class = ak.drop_none(ak.mask(target_meson_class, target_mask))
 
     true_p4_tensor = decode_kinematics_p4(
@@ -382,6 +382,8 @@ def model_inference(checkpoint_path, data_path, cfg):
     data = ak.concatenate([ak.from_parquet(path) for path in data_paths])
     print(f"Read {len(data):,} jets from {len(data_paths)} parquet files.", flush=True)
     ds = ParticleTransformerDETRDataset.for_arrays(cfg)
+    if cfg.dataset.get("pion_filter", False) or cfg.dataset.get("quality_cuts", False):
+        data = data[ds._selected_jets(data)]
     batch = ds.build_tensors(data)
 
     reco_jet_p4s = batch[6]
@@ -416,8 +418,8 @@ def create_predictions(
         tau_scores=tau_scores(outputs) if tau_threshold is not None else None,
         tau_threshold=tau_threshold,
     )
-    true_daughters = TauDaughter(*targets)
-    pred_daughters = TauDaughter(*predictions)
+    true_daughters = TauDaughter(*targets[:2])
+    pred_daughters = TauDaughter(*predictions[:2])
     return true_daughters, pred_daughters
 
 
@@ -426,10 +428,8 @@ def save_results(true_daughters, pred_daughters, output_path):
         {
             "pred_p4": pred_daughters.p4,
             "pred_charge": pred_daughters.charge,
-            "pred_meson_class": pred_daughters.meson_class,
             "true_p4": true_daughters.p4,
             "true_charge": true_daughters.charge,
-            "true_meson_class": true_daughters.meson_class,
         }
     )
     ak.to_parquet(results, output_path)
@@ -439,7 +439,6 @@ def save_results(true_daughters, pred_daughters, output_path):
 class TauDaughter:
     p4: torch.Tensor
     charge: torch.Tensor
-    meson_class: torch.Tensor
 
 
 def scan_thresholds(

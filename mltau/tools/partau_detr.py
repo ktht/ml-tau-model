@@ -2,6 +2,8 @@ import math
 
 import torch
 
+PION_MASS_GEV = 0.14
+
 
 def decode_kinematics(
     kinematics: torch.Tensor,
@@ -15,7 +17,7 @@ def decode_kinematics(
     """Decode ParTauDETR kinematics into Cartesian four-momenta.
 
     ``kinematics`` has final dimension
-    ``[log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio]``.
+    ``[log_pt_ratio, delta_eta, sin_dphi, cos_dphi]``.
     Reference tensors may omit trailing object dimensions, such as a ``[B]``
     jet reference used with ``[B, Q, 5]`` kinematics.
     """
@@ -33,17 +35,9 @@ def decode_kinematics(
     reference_phi = expand_reference(reference_phi)
     reference_energy = expand_reference(reference_energy)
 
-    reference_mass = torch.sqrt(
-        torch.clamp(
-            reference_energy**2 - (reference_pt * torch.cosh(reference_eta)) ** 2,
-            min=1e-12,
-        )
-    )
     log_pt_ratio = kinematics[..., 0]
-    log_mass_ratio = kinematics[..., 4]
     if clamp_log_ratios:
         log_pt_ratio = log_pt_ratio.clamp(-5.0, 5.0)
-        log_mass_ratio = log_mass_ratio.clamp(-5.0, 5.0)
 
     pt = torch.exp(log_pt_ratio) * reference_pt
     eta = kinematics[..., 1] + reference_eta
@@ -51,14 +45,12 @@ def decode_kinematics(
         max_abs_eta = math.acosh(math.sqrt(torch.finfo(kinematics.dtype).max))
         eta = eta.clamp(-max_abs_eta, max_abs_eta)
     phi = reference_phi + torch.atan2(kinematics[..., 2], kinematics[..., 3])
-    mass = torch.exp(log_mass_ratio) * reference_mass
-
     return torch.stack(
         [
             pt * torch.cos(phi),
             pt * torch.sin(phi),
             pt * torch.sinh(eta),
-            torch.sqrt((pt * torch.cosh(eta)) ** 2 + mass**2),
+            torch.sqrt((pt * torch.cosh(eta)) ** 2 + PION_MASS_GEV**2),
         ],
         dim=-1,
     )

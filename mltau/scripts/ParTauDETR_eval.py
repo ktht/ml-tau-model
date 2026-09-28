@@ -42,6 +42,8 @@ def evaluate_ParTauDETR(data_path, checkpoint_path, cfg):
     print(f"Read {len(data):,} jets from {data_path}.", flush=True)
 
     ds = ParticleTransformerDETRDataset.for_arrays(cfg)
+    if cfg.dataset.get("pion_filter", False) or cfg.dataset.get("quality_cuts", False):
+        data = data[ds._selected_jets(data)]
     batch = ds.build_tensors(data)
 
     reco_jet_p4s = batch[6]
@@ -124,7 +126,7 @@ def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
     charge_lut = outputs["pred_charge_logits"].new_tensor([-1, 0, 1], dtype=torch.long)
     pred_charge = charge_lut[pred_charge_cls]
 
-    pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
+    pred_meson_class = (pred_charge == 0).long()
 
     pred_p4_tensor = decode_kinematics(
         outputs["pred_kinematics"],
@@ -149,7 +151,7 @@ def get_true_particles(targets, reco_jet_p4s):
     target_charge = charge_lut[target_charge_cls]
     target_charge = ak.drop_none(ak.mask(target_charge, target_mask))
 
-    target_meson_class = targets["particles_meson_class_ohe"].argmax(dim=-1)
+    target_meson_class = (charge_lut[target_charge_cls] == 0).long()
     target_meson_class = ak.drop_none(ak.mask(target_meson_class, target_mask))
 
     true_p4_tensor = decode_kinematics(

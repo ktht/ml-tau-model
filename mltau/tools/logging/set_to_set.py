@@ -35,6 +35,7 @@ import awkward as ak
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from mltau.tools.partau_detr import PION_MASS_GEV
 from scipy.optimize import linear_sum_assignment
 
 from mltau.tools.evaluation import charge_id as c
@@ -190,7 +191,7 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     latter so that `log_all_kinematics_metrics` can be reused unchanged.
 
     Args:
-        kin:    [B, S, 5] daughter kinematics in the training parameterisation
+        kin:    [B, S, 4] daughter kinematics in the training parameterisation
         charge: [B, S] integer charge in {-1, 0, +1}
         pdg:    [B, S] absolute PDG id
         valid:  [B, S] bool, which slots count
@@ -209,12 +210,7 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     px = (pt * torch.cos(phi) * mask).sum(-1)
     py = (pt * torch.sin(phi) * mask).sum(-1)
     pz = (pt * torch.sinh(eta) * mask).sum(-1)
-    # Daughters are treated as massless in the sum: at these momenta a pion's
-    # mass is ~0.01% of its energy, and using the predicted log-mass instead
-    # would make the tau energy depend on the least determined component of the
-    # target. The tau mass is then still non-zero, as it comes from the opening
-    # angles between the daughters.
-    energy = (pt * torch.cosh(eta) * mask).sum(-1)
+    energy = (torch.sqrt((pt * torch.cosh(eta)) ** 2 + PION_MASS_GEV**2) * mask).sum(-1)
 
     pt_tau = torch.sqrt(px**2 + py**2 + eps)
     eta_tau = torch.asinh(pz / pt_tau)

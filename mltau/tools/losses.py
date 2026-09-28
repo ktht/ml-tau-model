@@ -240,9 +240,12 @@ class TauLoss(nn.Module):
             # what silently happened to MultiParTau between 2026-09-15 and this
             # change.
             phi_chord_loss = chord
-        log_mass_loss = self.kin_loss_fn(
-            predictions[:, 4] / s["log_mass"], targets[:, 4] / s["log_mass"]
-        )
+        if predictions.size(-1) == 5:
+            log_mass_loss = self.kin_loss_fn(
+                predictions[:, 4] / s["log_mass"], targets[:, 4] / s["log_mass"]
+            )
+        else:
+            log_mass_loss = None
 
         # Combined per-sample loss, weighted per component and normalised by the
         # weight sum so the overall scale does not move when weights are retuned.
@@ -251,14 +254,15 @@ class TauLoss(nn.Module):
             w["log_pt"] * log_pt_loss
             + w["delta_eta"] * delta_eta_loss
             + w["phi_chord"] * phi_chord_loss
-            + w["log_mass"] * log_mass_loss
-        ) / (sum(w.values()) + 1e-12)
+            + (w["log_mass"] * log_mass_loss if log_mass_loss is not None else 0)
+           ) / (sum(w[key] for key in ("log_pt", "delta_eta", "phi_chord"))
+               + (w["log_mass"] if log_mass_loss is not None else 0) + 1e-12)
 
         return per_sample_loss, {
             "log_pt": log_pt_loss,
             "delta_eta": delta_eta_loss,
             "phi_chord": phi_chord_loss,
-            "log_mass": log_mass_loss,
+            **({"log_mass": log_mass_loss} if log_mass_loss is not None else {}),
         }
 
     def compute_kinematics_loss(self, predictions, targets, weights):

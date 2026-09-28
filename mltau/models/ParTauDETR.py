@@ -17,9 +17,8 @@ class ParTauDETR(ParticleTransformer):
 
     Decoder heads per query:
       - pred_logits: object vs no-object
-      - pred_kinematics: regression (5D kinematics target)
+      - pred_kinematics: regression (4D kinematics target)
       - pred_charge_logits: charge classification logits
-      - pred_meson_class_logits: configured meson classification logits
 
     Jet-level head:
       - is_tau: binary tau-tagging logits from the pooled global token.
@@ -28,10 +27,9 @@ class ParTauDETR(ParticleTransformer):
     def __init__(
         self,
         input_dim: int,
-        num_meson_classes: int,
         num_queries: int = 8,
         num_charge_classes: int = 3,
-        num_kinematics_components: int = 5,
+        num_kinematics_components: int = 4,
         # decoder configuration
         decoder_num_layers: int = 4,
         decoder_num_heads: int | None = None,
@@ -127,7 +125,6 @@ class ParTauDETR(ParticleTransformer):
             nn.Linear(embed_dim, num_kinematics_components),
         )
         self.charge_head = nn.Linear(embed_dim, num_charge_classes)
-        self.meson_class_head = nn.Linear(embed_dim, num_meson_classes)
 
         # Jet-level tau-tagging head. The global (cls) token already pools the
         # whole jet, so a small MLP on top of it is all that is needed for the
@@ -268,7 +265,6 @@ class ParTauDETR(ParticleTransformer):
                 "pred_logits": self.objectness_head(hs),
                 "pred_kinematics": self.kinematics_head(hs),
                 "pred_charge_logits": self.charge_head(hs),
-                "pred_meson_class_logits": self.meson_class_head(hs),
             }
 
             # Jet-level tau-tagging logits from the pooled global token.

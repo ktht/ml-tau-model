@@ -61,9 +61,7 @@ model:
     # the objectness class balance -- see loss.eos_coef.
     num_queries: ${dataset.max_tau_daughters}
     num_charge_classes: 3
-    num_kinematics_components: 5
-    # The PDG head width is derived from dataset.tau_daughter_pdg_ids, which is
-    # the same list the dataloader one-hot encodes against. Do not duplicate it.
+    num_kinematics_components: 4
 
     # ParticleTransformer encoder
     encoder:
@@ -90,14 +88,13 @@ model:
             cost_objectness: 1.0
             cost_kinematics_l1: 2.0
             cost_charge: 1.0
-            cost_meson_class_ce: 1.0
             # Per-component weights of the kinematics matching cost, over
-            # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
+            # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi].
             # These decide WHICH daughter a query is trained towards, so what
             # matters is not that every component counts equally but that the
             # assignment stays stable while the model is still wrong. Tau
             # daughters are collimated (measured on z_train: sigma =
-            # [0.875, 0.077, 0.071, 0.028, 1.064]), so while the angular error is
+            # [0.875, 0.077, 0.071, 0.028]), so while the angular error is
             # of order sigma, position cannot tell two daughters apart and pt
             # and identity -- learned first -- have to carry the decision.
             # Angles at 1/sigma (20) drowned them out: on synthetic daughters
@@ -106,11 +103,9 @@ model:
             # against 93% / 11% for the first model's unweighted cost. With 5
             # and the clipped class cost below: 94% / 10% early, 99.4% / 0.9%
             # late. sin_dphi and cos_dphi MUST share a weight (together they
-            # encode the angle). log_mass_ratio stays low: only ~5% of its
-            # variance is the daughter's own, the rest is the jet mass shared by
-            # every query in the jet, so it says little about WHICH daughter.
-            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0, 0.2]
-            # How the charge and PDG terms enter the MATCHING cost (not the
+            # encode the angle).
+            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0]
+            # How the charge term enters the MATCHING cost (not the
             # loss). "clipped_nll" is -log p(true class) clamped at
             # classification_cost_clip: sharp enough that identity decides a tie
             # in position (a wrong class at p = 0.01 costs 4.6, a soft p = 0.6
@@ -128,9 +123,7 @@ model:
             weight_tau_id: 1.0
             weight_kinematics: 5.0
             weight_charge: 1.0
-            weight_meson_class: 1.0
-            weight_consistency: 0.1
-            weight_charge_count: 0.1
+            weight_charge_count: 0.0
             weight_parent_kinematics: 0.0
             weight_parent_charge: 0.0
             weight_parent_decay_mode: 0.0
@@ -139,9 +132,9 @@ model:
             # sharpened around the calibrated inference threshold t as
             # sigmoid((logit(p) - logit(t)) / temperature). Keep the temperature
             # between 0 and 1.
-            weight_soft_parent_kinematics: 0.0
-            weight_soft_parent_charge: 0.0
-            weight_soft_parent_decay_mode: 0.0
+            weight_soft_parent_kinematics: 1.0
+            weight_soft_parent_charge: 1.0
+            weight_soft_parent_decay_mode: 1.0
             parent_objectness_temperature: 0.1
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
@@ -189,19 +182,24 @@ model:
         #   log_pt_ratio  sigma 0.875
         #   delta_eta     sigma 0.077
         #   sin_dphi      sigma 0.071   (the chord is ~|dphi| for collimated daughters)
-        #   log_mass_ratio sigma 1.064
         # Recompute these if the target parameterisation or the sample changes;
         # they are properties of the data, not tuning knobs.
         kinematics_scales:
             log_pt: 0.88
             delta_eta: 0.077
             phi_chord: 0.080
-            log_mass: 1.06
-        # With the residuals scaled, equal weights give each component an equal
-        # share. log_mass is the one worth reconsidering rather than reweighting:
-        # only 4.8% of the variance of log(m_dau/m_jet) comes from the daughter's
-        # identity, the other 95% is the jet mass, which every query in the jet
-        # would be re-deriving. See the note in the loss docstring.
+        # With the residuals scaled, equal weights give each component an equal share.
+        kinematics_weights:
+            log_pt: 1.0
+            delta_eta: 1.0
+            phi_chord: 1.0
+
+    # The summed visible tau has a mass even though each daughter's mass is
+    # fixed. Parent constraints use a separate five-component loss: daughter
+    # residual scales are not appropriate for parent kinematics. Measure parent
+    # scales before tuning these constraints; null uses the unscaled fallback.
+    parent_tau_loss:
+        kinematics_scales: null
         kinematics_weights:
             log_pt: 1.0
             delta_eta: 1.0
