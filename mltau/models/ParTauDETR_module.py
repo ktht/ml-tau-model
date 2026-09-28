@@ -889,7 +889,9 @@ class SetCriterion(nn.Module):
                 pred_kinematics,
                 kinematics_reference_p4,
             )
-            pred_parent_p4 = (pred_p4 * soft_query_weights.unsqueeze(-1)).sum(dim=1)
+            pred_parent_p4 = (
+                pred_p4 * soft_query_weights.detach().unsqueeze(-1)
+            ).sum(dim=1)
             loss_soft_parent_kinematics = self._compute_parent_kinematics_loss(
                 pred_parent_p4,
                 target_parent_p4,
