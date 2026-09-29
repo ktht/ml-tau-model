@@ -576,6 +576,64 @@ class SetCriterion(nn.Module):
             clamp_log_ratios=True,
         )
 
+    @torch.no_grad()
+    def _matching_diagnostics(
+        self,
+        pred_kinematics: torch.Tensor,
+        matched: torch.Tensor,
+        hard_selected: torch.Tensor,
+        gate: torch.Tensor,
+        target_mask: torch.Tensor,
+        signal_mask: torch.Tensor,
+        target_parent_p4: dict[str, torch.Tensor],
+        kinematics_reference_p4: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        signal = signal_mask.to(gate.dtype)
+        def signal_mean(values: torch.Tensor) -> torch.Tensor:
+            return (values * signal).sum() / signal.sum().clamp_min(1)
+
+        matched_float = matched.to(gate.dtype)
+        intersection = (gate * matched_float).sum(dim=1)
+        union = torch.maximum(gate, matched_float).sum(dim=1)
+        hard_intersection = matched & hard_selected
+        hard_union = matched | hard_selected
+        missed = matched & ~hard_selected
+        extra = ~matched & hard_selected
+        diagnostics = {
+            "matching/soft_iou": signal_mean(torch.where(union > 0, intersection / union.clamp_min(1e-8), 1.0)),
+            "matching/hard_iou": signal_mean(torch.where(hard_union.any(dim=1), hard_intersection.sum(dim=1) / hard_union.sum(dim=1).clamp_min(1), 1.0)),
+            "matching/hard_iou_gate_weighted": signal_mean(torch.where(
+                hard_union.any(dim=1),
+                (gate * hard_intersection).sum(dim=1) / (gate * hard_union).sum(dim=1).clamp_min(1e-8),
+                1.0,
+            )),
+            "matching/matched_below_threshold": signal_mean(missed.sum(dim=1)),
+            "matching/matched_below_threshold_gate_weighted": signal_mean((gate * missed).sum(dim=1)),
+            "matching/selected_unmatched": signal_mean(extra.sum(dim=1)),
+            "matching/selected_unmatched_gate_weighted": signal_mean((gate * extra).sum(dim=1)),
+            "matching/soft_count_error": signal_mean(gate.sum(dim=1) - target_mask.sum(dim=1)),
+            "matching/hard_count_error": signal_mean(hard_selected.sum(dim=1) - target_mask.sum(dim=1)),
+        }
+
+        pred_p4 = self._decode_predicted_p4(pred_kinematics.float(), kinematics_reference_p4)
+        true_pt = target_parent_p4["pt"].float().clamp_min(1e-8)
+        true_momentum = true_pt * torch.cosh(target_parent_p4["eta"].float())
+        true_energy = target_parent_p4["energy"].float().clamp_min(1e-8)
+        selections = {
+            "unmatched_gate_weighted": gate * (~matched),
+            "selected_unmatched": extra.to(gate.dtype),
+            "matched_below_threshold": missed.to(gate.dtype),
+            "matched_selected": hard_intersection.to(gate.dtype),
+        }
+        for name, query_weights in selections.items():
+            summed = (pred_p4 * query_weights.unsqueeze(-1)).sum(dim=1)
+            momentum = torch.linalg.vector_norm(summed[:, :3], dim=1)
+            pt = torch.linalg.vector_norm(summed[:, :2], dim=1)
+            diagnostics[f"momentum/{name}_p_over_parent"] = signal_mean(momentum / true_momentum.clamp_min(1e-8))
+            diagnostics[f"momentum/{name}_energy_over_parent"] = signal_mean(summed[:, 3] / true_energy)
+            diagnostics[f"momentum/{name}_pt_over_parent"] = signal_mean(pt / true_pt)
+        return diagnostics
+
     def _compute_parent_charge_loss(
         self,
         charge_probabilities: torch.Tensor,
@@ -912,6 +970,13 @@ class SetCriterion(nn.Module):
             F.softmax(pred_logits.float(), dim=-1)[..., self.object_class_index]
             >= objectness_threshold
         )
+        with torch.no_grad():
+            matched_query_mask = tgt_classes == self.object_class_index
+            matching_diagnostics = self._matching_diagnostics(
+                pred_kinematics, matched_query_mask, hard_query_mask,
+                soft_query_weights, target_mask, signal_mask,
+                target_parent_p4, kinematics_reference_p4,
+            )
         count_match = hard_query_mask.sum(dim=1) == target_mask.sum(dim=1)
         eligible = signal_mask & count_match
         count_match_fraction = eligible.sum().to(pred_logits.dtype) / (
@@ -1062,6 +1127,7 @@ class SetCriterion(nn.Module):
             "loss_soft_parent_decay_mode": loss_soft_parent_decay_mode,
             "num_matched": pred_logits.new_tensor(float(num_matched)),
             "num_charge_supervised": num_charge_supervised.to(pred_logits.dtype),
+            **matching_diagnostics,
             **{k: pred_logits.new_tensor(v) for k, v in self.matcher.last_cost_terms.items()},
         }
 
@@ -1551,6 +1617,8 @@ class ParTauDETRModule(L.LightningModule):
         for key, value in losses.items():
             if key.startswith("cost/"):
                 self.log(key, value, on_step=False, on_epoch=True)
+            elif key.startswith(("matching/", "momentum/")):
+                self.log(f"train/{key}", value, on_step=True, on_epoch=True)
         self.log("counts/num_charge_supervised", losses["num_charge_supervised"],
                  on_step=False, on_epoch=True)
 
@@ -1888,6 +1956,9 @@ class ParTauDETRModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
         )
+        for key, value in losses.items():
+            if key.startswith(("matching/", "momentum/")):
+                self.log(f"val/{key}", value, on_step=False, on_epoch=True)
 
         if not self.trainer.sanity_checking:
             self._accumulate_jet_level(batch, outputs, targets)
