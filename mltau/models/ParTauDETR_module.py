@@ -243,6 +243,7 @@ class HungarianMatcher(nn.Module):
         target_kinematics: torch.Tensor,
         target_charge_cls: torch.Tensor,
         target_mask: torch.Tensor,
+        target_weights: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
@@ -252,6 +253,7 @@ class HungarianMatcher(nn.Module):
             target_kinematics: [B, T, K]
             target_charge_cls: [B, T]
             target_mask: [B, T]
+            target_weights: optional [B, T] per-true-daughter weights.
 
         Returns:
             (batch_idx, query_idx, target_idx), three flat int64 tensors of equal
@@ -303,6 +305,8 @@ class HungarianMatcher(nn.Module):
             + self.cost_kinematics_l1 * kin_cost
             + self.cost_charge_ce * charge_cost
         )
+        if target_weights is not None:
+            total_cost = total_cost * target_weights.float().unsqueeze(1)
         total_cost = torch.nan_to_num(total_cost, nan=0.0, posinf=1e4, neginf=-1e4)
         total_cost = total_cost.masked_fill(
             ~target_mask.unsqueeze(1), self._PAD_COST
@@ -342,6 +346,11 @@ class HungarianMatcher(nn.Module):
                     "kinematics": self.cost_kinematics_l1 * kin_cost[b_sel, q_sel, t_sel],
                     "charge": self.cost_charge_ce * charge_cost[b_sel, q_sel, t_sel],
                 }
+                if target_weights is not None:
+                    terms = {
+                        key: value * target_weights[b_sel, t_sel]
+                        for key, value in terms.items()
+                    }
                 means = {k: float(v.mean()) for k, v in terms.items()}
                 total = sum(means.values()) or 1.0
                 self.last_cost_terms = {
@@ -373,11 +382,9 @@ class SetCriterion(nn.Module):
       has no other purpose.
         - Objectness answers "which queries are real daughters of this tau", and
             together with kinematics, charge and the parent constraints
-      it is trained on signal jets only and UNWEIGHTED. Reweighting the
-      reconstruction would reshape the pt spectrum the regression and
-      classification heads are optimised on without decorrelating anything;
-      the first model trained them unweighted (its production had no
-      cls_weight column) and that is the behaviour kept.
+            it is trained on signal jets only. The optional true daughter pt ratio
+            weights the matching cost only; daughter losses stay unweighted and cls_weight
+            never weights reconstruction.
     - Background jets are deliberately NOT pushed towards "no object": on a
       background jet objectness is untrained and its scores are meaningless, so
       inference and evaluation gate the daughter set with the tauID score.
@@ -406,6 +413,8 @@ class SetCriterion(nn.Module):
         object_class_index: int = 0,
         eos_coef: float = 0.1,
         ignore_index: int = -100,
+        weight_daughters_by_pt: bool = False,
+        daughter_pt_weight_min: float = 0.1,
     ):
         super().__init__()
         self.matcher = matcher
@@ -435,6 +444,10 @@ class SetCriterion(nn.Module):
         self.object_class_index = object_class_index
         self.eos_coef = eos_coef
         self.ignore_index = ignore_index
+        if not 0.0 < daughter_pt_weight_min <= 1.0:
+            raise ValueError("daughter_pt_weight_min must be in (0, 1].")
+        self.weight_daughters_by_pt = weight_daughters_by_pt
+        self.daughter_pt_weight_min = daughter_pt_weight_min
 
 
     @staticmethod
@@ -618,6 +631,7 @@ class SetCriterion(nn.Module):
         target_is_tau: torch.Tensor | None = None,
         jet_weights: torch.Tensor | None = None,
         objectness_threshold: torch.Tensor | float = 0.5,
+        target_pt: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         pred_logits = outputs["pred_logits"]
         pred_kinematics = outputs["pred_kinematics"]
@@ -640,6 +654,12 @@ class SetCriterion(nn.Module):
         # actual mix is set by dataset.max_jets_per_sample and, for the tauID
         # loss, by cls_weight; do not assume a ratio here.)
         match_mask = target_mask & signal_mask.unsqueeze(1)
+        target_weights = None
+        if self.weight_daughters_by_pt:
+            parent_pt = target_parent_p4["pt"].float()
+            target_weights = (target_pt.float() / parent_pt.clamp_min(1e-8)[:, None]).clamp_min(
+                self.daughter_pt_weight_min
+            )
         pair_b, pair_q, pair_t = self.matcher(
             pred_logits=pred_logits,
             pred_kinematics=pred_kinematics,
@@ -647,6 +667,7 @@ class SetCriterion(nn.Module):
             target_kinematics=target_kinematics,
             target_charge_cls=target_charge_cls,
             target_mask=match_mask,
+            target_weights=target_weights,
         )
         num_matched = pair_b.numel()
 
@@ -1199,6 +1220,8 @@ class ParTauDETRModule(L.LightningModule):
             object_class_index=0,
             eos_coef=float(detr_cfg.loss.eos_coef),
             ignore_index=self.ignore_index,
+            weight_daughters_by_pt=bool(detr_cfg.loss.get("weight_daughters_by_pt", False)),
+            daughter_pt_weight_min=float(detr_cfg.loss.get("daughter_pt_weight_min", 0.1)),
         )
 
         # Starting value and fallback for the objectness threshold; the
@@ -1397,6 +1420,7 @@ class ParTauDETRModule(L.LightningModule):
             target_kinematics=target_kinematics,
             target_charge_cls=target_charge_cls,
             target_mask=target_mask,
+            target_pt=targets.get("particles_pt"),
             target_parent_charge=target_parent_charge,
             target_parent_decay_mode=target_parent_decay_mode,
             target_parent_p4=gen_jet_tau_p4,
@@ -1766,6 +1790,7 @@ class ParTauDETRModule(L.LightningModule):
             target_kinematics=target_kinematics,
             target_charge_cls=target_charge_cls,
             target_mask=target_mask,
+            target_pt=targets.get("particles_pt"),
             target_parent_charge=target_parent_charge,
             target_parent_decay_mode=target_parent_decay_mode,
             target_parent_p4=gen_jet_tau_p4,

@@ -360,6 +360,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             n_slots = max(int(max_tau_daughters), 0)
             daughter_mask_np = np.zeros((n_jets, n_slots), dtype=bool)
             daughter_kinematics_np = np.zeros((n_jets, n_slots, 4), dtype=np.float32)
+            dau_pt = np.zeros((n_jets, n_slots), dtype=np.float32)
             daughter_charge = np.zeros((n_jets, n_slots), dtype=np.int64)
             daughter_pdg = np.zeros((n_jets, n_slots), dtype=np.int64)
 
@@ -380,6 +381,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         targets = {
             "particles_mask": torch.from_numpy(daughter_mask_np).bool(),
             "particles_kinematics": torch.from_numpy(daughter_kinematics_np).float(),
+            "particles_pt": torch.from_numpy(dau_pt * daughter_mask_np).float(),
             "particles_charge_ohe": torch.from_numpy(charge_ohe).float(),
             # Jet-level tau-tagging label, following ParticleTransformerDataset:
             # -1 -> no genuine tau (background), >= 0 -> genuine tau (signal).

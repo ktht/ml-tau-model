@@ -119,6 +119,10 @@ model:
             classification_cost: clipped_nll
             classification_cost_clip: 5.0
         loss:
+            # Reweight the full Hungarian matching cost, not the daughter losses,
+            # by max(true daughter pt / true visible tau pt, daughter_pt_weight_min).
+            weight_daughters_by_pt: false
+            daughter_pt_weight_min: 0.1
             weight_objectness: 1.0
             weight_tau_id: 1.0
             weight_kinematics: 5.0
