@@ -400,6 +400,8 @@ class SetCriterion(nn.Module):
         loss_soft_parent_charge_weight: float = 0.0,
         loss_soft_parent_decay_mode_weight: float = 0.0,
         parent_objectness_temperature: float = 0.1,
+        soft_parent_kinematics_mode: str = "soft_detached",
+        soft_parent_kinematics_require_count_match: bool = False,
         no_object_class_index: int = 1,
         object_class_index: int = 0,
         eos_coef: float = 0.1,
@@ -423,6 +425,12 @@ class SetCriterion(nn.Module):
         if not 0.0 < parent_objectness_temperature < 1.0:
             raise ValueError("parent_objectness_temperature must be between 0 and 1.")
         self.parent_objectness_temperature = parent_objectness_temperature
+        if soft_parent_kinematics_mode not in (
+            "soft", "soft_detached", "hard", "straight_through"
+        ):
+            raise ValueError(f"Invalid soft_parent_kinematics_mode: {soft_parent_kinematics_mode}")
+        self.soft_parent_kinematics_mode = soft_parent_kinematics_mode
+        self.soft_parent_kinematics_require_count_match = soft_parent_kinematics_require_count_match
         self.no_object_class_index = no_object_class_index
         self.object_class_index = object_class_index
         self.eos_coef = eos_coef
@@ -863,10 +871,7 @@ class SetCriterion(nn.Module):
         if self.loss_parent_decay_mode_weight > 0:
             total_loss = total_loss + self.loss_parent_decay_mode_weight * loss_parent_decay_mode
 
-        # Soft constraints use every query, weighted by a smooth version of the
-        # objectness threshold. Queries well above the threshold contribute
-        # almost fully, queries well below it contribute almost nothing, and
-        # queries near it change smoothly so gradients can pass through.
+        # Soft constraints use every query, weighted around the objectness threshold.
         use_soft_parent_constraints = any(
             weight > 0
             for weight in (
@@ -882,6 +887,21 @@ class SetCriterion(nn.Module):
                 pred_logits, objectness_threshold
             )
 
+        hard_query_mask = (
+            F.softmax(pred_logits.float(), dim=-1)[..., self.object_class_index]
+            >= objectness_threshold
+        )
+        count_match = hard_query_mask.sum(dim=1) == target_mask.sum(dim=1)
+        eligible = signal_mask & count_match
+        count_match_fraction = eligible.sum().to(pred_logits.dtype) / (
+            signal_mask.sum() + 1e-8
+        )
+        kinematics_parent_weights = (
+            eligible.to(parent_weights.dtype)
+            if self.soft_parent_kinematics_require_count_match
+            else parent_weights
+        )
+
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_soft_parent_kinematics_weight > 0
         ):
@@ -889,14 +909,28 @@ class SetCriterion(nn.Module):
                 pred_kinematics,
                 kinematics_reference_p4,
             )
-            pred_parent_p4 = (
-                pred_p4 * soft_query_weights.detach().unsqueeze(-1)
-            ).sum(dim=1)
-            loss_soft_parent_kinematics = self._compute_parent_kinematics_loss(
-                pred_parent_p4,
-                target_parent_p4,
-                parent_weights,
-            )
+            mode = self.soft_parent_kinematics_mode
+            hard_loss = pred_logits.new_zeros(())
+            soft_loss = pred_logits.new_zeros(())
+            if mode in ("hard", "straight_through"):
+                hard_parent_p4 = (
+                    pred_p4 * hard_query_mask.unsqueeze(-1)
+                ).sum(dim=1)
+                hard_loss = self._compute_parent_kinematics_loss(
+                    hard_parent_p4, target_parent_p4, kinematics_parent_weights
+                )
+            if mode != "hard":
+                gate = soft_query_weights.detach() if mode == "soft_detached" else soft_query_weights
+                soft_parent_p4 = (pred_p4 * gate.unsqueeze(-1)).sum(dim=1)
+                soft_loss = self._compute_parent_kinematics_loss(
+                    soft_parent_p4, target_parent_p4, kinematics_parent_weights
+                )
+            if mode == "straight_through":
+                loss_soft_parent_kinematics = hard_loss.detach() + soft_loss - soft_loss.detach()
+            elif mode == "hard":
+                loss_soft_parent_kinematics = hard_loss
+            else:
+                loss_soft_parent_kinematics = soft_loss
         if self.loss_soft_parent_kinematics_weight > 0:
             total_loss = (
                 total_loss
@@ -1002,6 +1036,7 @@ class SetCriterion(nn.Module):
             "loss_parent_charge": loss_parent_charge,
             "loss_parent_decay_mode": loss_parent_decay_mode,
             "loss_soft_parent_kinematics": loss_soft_parent_kinematics,
+            "soft_parent_kinematics_count_match_fraction": count_match_fraction,
             "loss_soft_parent_charge": loss_soft_parent_charge,
             "loss_soft_parent_decay_mode": loss_soft_parent_decay_mode,
             "num_matched": pred_logits.new_tensor(float(num_matched)),
@@ -1154,6 +1189,12 @@ class ParTauDETRModule(L.LightningModule):
             loss_soft_parent_charge_weight=float(detr_cfg.loss.weight_soft_parent_charge),
             loss_soft_parent_decay_mode_weight=float(detr_cfg.loss.weight_soft_parent_decay_mode),
             parent_objectness_temperature=float(detr_cfg.loss.parent_objectness_temperature),
+            soft_parent_kinematics_mode=str(
+                detr_cfg.loss.get("soft_parent_kinematics_mode", "soft_detached")
+            ),
+            soft_parent_kinematics_require_count_match=bool(
+                detr_cfg.loss.get("soft_parent_kinematics_require_count_match", False)
+            ),
             no_object_class_index=1,
             object_class_index=0,
             eos_coef=float(detr_cfg.loss.eos_coef),
@@ -1453,6 +1494,12 @@ class ParTauDETRModule(L.LightningModule):
             "train_losses/soft_parent_kinematics",
             losses["loss_soft_parent_kinematics"],
             on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "train/soft_parent_kinematics_count_match_fraction",
+            losses["soft_parent_kinematics_count_match_fraction"],
+            on_step=True,
             on_epoch=True,
         )
         self.log(
@@ -1795,6 +1842,12 @@ class ParTauDETRModule(L.LightningModule):
         self.log(
             "val_losses/soft_parent_kinematics",
             losses["loss_soft_parent_kinematics"],
+            on_step=False,
+            on_epoch=True,
+        )
+        self.log(
+            "val/soft_parent_kinematics_count_match_fraction",
+            losses["soft_parent_kinematics_count_match_fraction"],
             on_step=False,
             on_epoch=True,
         )

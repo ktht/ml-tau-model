@@ -136,6 +136,13 @@ model:
             weight_soft_parent_charge: 1.0
             weight_soft_parent_decay_mode: 1.0
             parent_objectness_temperature: 0.1
+            # Parent kinematics only: soft (gate gradients), soft_detached
+            # (no gate gradients), hard (inference-like selection), or
+            # straight_through (hard loss value, soft loss gradient).
+            soft_parent_kinematics_mode: soft_detached
+            # Restrict this loss to signal jets with exactly as many queries
+            # above the inference threshold as valid target daughters.
+            soft_parent_kinematics_require_count_match: false
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
             # queries the two sides carry equal total weight at
