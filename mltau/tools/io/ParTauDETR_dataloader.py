@@ -143,6 +143,17 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         for track_parameter in (cand_dz, cand_dz_err, cand_dxy, cand_dxy_err):
             track_parameter[neutral_mask] = 0.0
 
+        cand_log_dz_significance = np.zeros_like(cand_dz)
+        valid_dz = cand_dz_err > 0
+        cand_log_dz_significance[valid_dz] = np.log(
+            np.maximum(np.abs(cand_dz[valid_dz] / cand_dz_err[valid_dz]), eps)
+        )
+        cand_log_dxy_significance = np.zeros_like(cand_dxy)
+        valid_dxy = cand_dxy_err > 0
+        cand_log_dxy_significance[valid_dxy] = np.log(
+            np.maximum(np.abs(cand_dxy[valid_dxy] / cand_dxy_err[valid_dxy]), eps)
+        )
+
         lengths = np.minimum(ak.to_numpy(ak.num(data.reco_cand_pdgs)), max_cands)
         mask_np = np.arange(max_cands)[None, :] < lengths[:, None]
 
@@ -199,9 +210,9 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 is_charged_hadron,
                 is_neutral_hadron,
                 cand_dz,
-                cand_dz_err,
+                cand_log_dz_significance,
                 cand_dxy,
-                cand_dxy_err,
+                cand_log_dxy_significance,
             ],
             axis=1,
         )
