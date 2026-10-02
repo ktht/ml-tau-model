@@ -17,7 +17,7 @@ dataset:
      # generator-level tau after the pT cut. Note that this is only an issue if
      # the pT cut is enabled and weight_parent_* weights are positive.
     tau_daughter_pt_cut: -1.0
-    data_dir: /scratch/persistent/karl/ml-tau/0921_ParTauDETR_dataset/
+    data_dir: /scratch/persistent/karl/ml-tau/1002_ParTauDETR_dataset/
 
     # Meson classes for daughter one-hot encoding. Mapping order defines class
     # indices and charges defines valid charge-head combinations. All unlisted

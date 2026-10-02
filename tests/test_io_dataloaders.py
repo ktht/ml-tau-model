@@ -26,7 +26,10 @@ from omegaconf import OmegaConf
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mltau.tools.io.ParT_dataloader import ParTDataModule  # noqa: E402
+from mltau.tools.io.ParT_dataloader import (  # noqa: E402
+    ParTDataModule,
+    sort_candidates_by_pt,
+)
 from mltau.tools.io.ParTauDETR_dataloader import (  # noqa: E402
     ParTauDETRDataModule,
     ParticleTransformerDETRDataset,
@@ -120,6 +123,25 @@ def check_tau_daughter_sorting():
     ).tolist() == [[0, 1]]
 
 
+def check_signed_candidate_sorting():
+    data = ak.Array(
+        [
+            {
+                "reco_cand_p4s": [
+                    {"pt": 4.0, "eta": 0.1, "phi": 0.2, "mass": 0.14},
+                    {"pt": 12.0, "eta": 0.2, "phi": 0.3, "mass": 0.14},
+                ],
+                "reco_cand_signed_dz": [0.4, -1.2],
+                "reco_cand_signed_dxy": [-0.04, 0.12],
+            }
+        ]
+    )
+    sorted_data = sort_candidates_by_pt(data)
+
+    assert ak.to_list(sorted_data.reco_cand_signed_dz) == [[-1.2, 0.4]]
+    assert ak.to_list(sorted_data.reco_cand_signed_dxy) == [[0.12, -0.04]]
+
+
 def run(main: str, dataset: str, module_cls, label: str, batch_size: int = 256):
     print(f"[{label}]")
     cfg = compose(main, dataset, batch_size)
@@ -135,6 +157,7 @@ def run(main: str, dataset: str, module_cls, label: str, batch_size: int = 256):
 if __name__ == "__main__":
     torch.manual_seed(0)
     check_tau_daughter_sorting()
+    check_signed_candidate_sorting()
     run("main.yaml", "dataset.yaml", ParTDataModule, "ParT data module")
     run("main_ParTauDETR.yaml", "dataset_ParTauDETR.yaml", ParTauDETRDataModule, "DETR data module")
     print("\nAll dataloader tests passed.")
