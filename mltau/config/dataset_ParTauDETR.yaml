@@ -1,6 +1,16 @@
 dataset:
     max_cands: 20
     num_features: 17
+    # Lifetime input features remain [signed dz, dz error, signed dxy, dxy
+    # error] by default. Set use_log_significance=true to replace each error
+    # with log(abs(IP) / IP_error). A positive transform_scale replaces each
+    # signed IP with 2 * arctan(transform_scale * IP) / pi; zero or a negative
+    # value leaves it unchanged. For example:
+    #   dataset.impact_parameter_features.use_log_significance=true
+    #   dataset.impact_parameter_features.transform_scale=30
+    impact_parameter_features:
+        use_log_significance: false
+        transform_scale: 0.0
     # Target slots per jet, and (by interpolation) the number of decoder
     # queries. Measured over all 5.3M signal jets of the 0915 production with
     # check_query_budget.py: after the meson-class filter no tau has more than
