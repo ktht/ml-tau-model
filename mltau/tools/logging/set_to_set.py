@@ -48,6 +48,7 @@ from ntupelizer.tools import tau_decaymode as tdm
 from mltau.tools.logging import kinematics as kinematics_logging
 from mltau.tools.logging import tagging as tagging_logging
 from mltau.tools.logging.general import log_metrics_dict
+from mltau.tools.partau_detr import decode_kinematics
 
 # Decay mode is NOT derived here. It goes through ntupelizer.tools.tau_decaymode
 # (ml-tau-data), which classifies each daughter by particle PROPERTY -- charged
@@ -181,6 +182,8 @@ def decay_modes(pdg: np.ndarray, valid: np.ndarray) -> dict:
     }
 
 
+@torch.autocast(device_type="cuda", enabled=False)
+@torch.autocast(device_type="cpu", enabled=False)
 def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     """
     Collapse a set of daughters into per-jet quantities.
@@ -201,20 +204,11 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     eta_jet = reco_jet["eta"]
     phi_jet = reco_jet["phi"]
 
-    pt = torch.exp(kin[..., 0]) * pt_jet[:, None]
-    eta = kin[..., 1] + eta_jet[:, None]
-    phi = phi_jet[:, None] + torch.atan2(kin[..., 2], kin[..., 3])
-
-    mask = valid.to(pt.dtype)
-    px = (pt * torch.cos(phi) * mask).sum(-1)
-    py = (pt * torch.sin(phi) * mask).sum(-1)
-    pz = (pt * torch.sinh(eta) * mask).sum(-1)
-    # Daughters are treated as massless in the sum: at these momenta a pion's
-    # mass is ~0.01% of its energy, and using the predicted log-mass instead
-    # would make the tau energy depend on the least determined component of the
-    # target. The tau mass is then still non-zero, as it comes from the opening
-    # angles between the daughters.
-    energy = (pt * torch.cosh(eta) * mask).sum(-1)
+    daughter_p4 = decode_kinematics(
+        kin, pt_jet, eta_jet, phi_jet, reco_jet["energy"]
+    )
+    parent_p4 = daughter_p4.masked_fill(~valid.unsqueeze(-1), 0).sum(dim=1)
+    px, py, pz, energy = parent_p4.unbind(dim=-1)
 
     pt_tau = torch.sqrt(px**2 + py**2 + eps)
     eta_tau = torch.asinh(pz / pt_tau)

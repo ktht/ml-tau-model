@@ -310,10 +310,6 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 dtype=np.float32,
             )
 
-            # p4_field derives energy from any complete basis, including a
-            # (pt, eta, phi, mass) record. What it cannot do is invent a fourth
-            # coordinate, so a record carrying neither energy nor mass is the
-            # one case left to handle here: treat those daughters as massless.
             if has_p4_field(daughter_p4, "energy") or has_p4_field(
                 daughter_p4, "mass"
             ):
@@ -324,7 +320,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                     dtype=np.float32,
                 )
             else:
-                dau_energy = dau_pt * np.cosh(dau_eta)
+                raise ValueError("Daughter four-vectors must include energy or mass.")
 
             daughter_charge = self._pad_jagged(
                 daughter_charge_jag,

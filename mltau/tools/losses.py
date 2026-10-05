@@ -189,6 +189,8 @@ class TauLoss(nn.Module):
             loss = self.dm_loss_fn(predictions, targets.long())
         return weighted_mean(loss, weights)
 
+    @torch.autocast(device_type="cuda", enabled=False)
+    @torch.autocast(device_type="cpu", enabled=False)
     def _compute_kinematics_loss_per_sample(self, predictions, targets):
         """
         Per-sample Huber loss for (log pt, deta, phi_chord, log m).
@@ -210,6 +212,8 @@ class TauLoss(nn.Module):
         tail, instead of quadratic everywhere (delta_eta) or linear everywhere
         (a chord of order 1 at initialisation).
         """
+        predictions = predictions.float()
+        targets = targets.float()
         scaled = self.kinematics_scales is not None
         s = self.kinematics_scales or {
             "log_pt": 1.0, "delta_eta": 1.0, "phi_chord": 1.0, "log_mass": 1.0

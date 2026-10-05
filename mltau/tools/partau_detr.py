@@ -3,6 +3,8 @@ import math
 import torch
 
 
+@torch.autocast(device_type="cuda", enabled=False)
+@torch.autocast(device_type="cpu", enabled=False)
 def decode_kinematics(
     kinematics: torch.Tensor,
     reference_pt: torch.Tensor,
@@ -23,7 +25,10 @@ def decode_kinematics(
         if reference.device != kinematics.device:
             raise ValueError("Kinematics and reference tensors must share a device.")
 
+    kinematics = kinematics.float()
+
     def expand_reference(reference: torch.Tensor) -> torch.Tensor:
+        reference = reference.float()
         while reference.ndim < kinematics.ndim - 1:
             reference = reference.unsqueeze(-1)
         return reference
@@ -50,7 +55,11 @@ def decode_kinematics(
     if clamp_log_ratios:
         max_abs_eta = math.acosh(math.sqrt(torch.finfo(kinematics.dtype).max))
         eta = eta.clamp(-max_abs_eta, max_abs_eta)
-    phi = reference_phi + torch.atan2(kinematics[..., 2], kinematics[..., 3])
+    sin_dphi, cos_dphi = kinematics[..., 2], kinematics[..., 3]
+    undefined_phi = (sin_dphi == 0) & (cos_dphi == 0)
+    phi = reference_phi + torch.atan2(
+        sin_dphi, torch.where(undefined_phi, torch.ones_like(cos_dphi), cos_dphi)
+    )
     mass = torch.exp(log_mass_ratio) * reference_mass
 
     return torch.stack(

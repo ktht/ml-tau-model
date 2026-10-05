@@ -490,6 +490,8 @@ class SetCriterion(nn.Module):
             / self.parent_objectness_temperature
         )
 
+    @torch.autocast(device_type="cuda", enabled=False)
+    @torch.autocast(device_type="cpu", enabled=False)
     def _compute_parent_kinematics_loss(
         self,
         pred_parent_p4: torch.Tensor,
@@ -503,11 +505,22 @@ class SetCriterion(nn.Module):
         helper. Their total is expressed in the same relative kinematic form as
         the daughter loss, then compared with the parent tau target.
         """
+        selected = parent_weights > 0
+        pred_parent_p4 = pred_parent_p4[selected].float()
+        parent_weights = parent_weights[selected].float()
+        target_parent_p4 = {
+            name: value[selected] for name, value in target_parent_p4.items()
+        }
+        if pred_parent_p4.numel() == 0:
+            return pred_parent_p4.sum()
         device = pred_parent_p4.device
         pred_px, pred_py, pred_pz, pred_energy = pred_parent_p4.unbind(dim=-1)
         pred_pt = torch.sqrt((pred_px**2 + pred_py**2).clamp_min(1e-12))
         pred_eta = torch.asinh(pred_pz / pred_pt.clamp_min(1e-6))
-        pred_phi = torch.atan2(pred_py, pred_px)
+        undefined_phi = (pred_px == 0) & (pred_py == 0)
+        pred_phi = torch.atan2(
+            pred_py, torch.where(undefined_phi, torch.ones_like(pred_px), pred_px)
+        )
         pred_mass = torch.sqrt(
             torch.clamp(
                 pred_energy**2 - pred_px**2 - pred_py**2 - pred_pz**2,
@@ -567,7 +580,7 @@ class SetCriterion(nn.Module):
         references = {}
         for name in ("pt", "eta", "phi", "energy"):
             reference = kinematics_reference_p4[name].to(
-                dtype=pred_kinematics.dtype, device=pred_kinematics.device
+                dtype=torch.float32, device=pred_kinematics.device
             )
             if batch_indices is not None:
                 reference = reference[batch_indices]
@@ -896,7 +909,7 @@ class SetCriterion(nn.Module):
         # the Hungarian matcher. Other queries do not contribute to the parent.
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_parent_kinematics_weight > 0
-        ):
+        ), torch.autocast(device_type=device.type, enabled=False):
             pred_p4 = self._decode_predicted_p4(
                 pred_kinematics[pair_b, pair_q],
                 kinematics_reference_p4,
@@ -1026,16 +1039,16 @@ class SetCriterion(nn.Module):
 
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_soft_parent_kinematics_weight > 0
-        ):
+        ), torch.autocast(device_type=device.type, enabled=False):
             pred_p4 = self._decode_predicted_p4(
-                pred_kinematics,
-                kinematics_reference_p4,
+                pred_kinematics[signal_mask],
+                {name: value[signal_mask] for name, value in kinematics_reference_p4.items()},
             )
-            pred_parent_p4 = (pred_p4 * soft_query_weights.unsqueeze(-1)).sum(dim=1)
+            pred_parent_p4 = (pred_p4 * soft_query_weights[signal_mask].unsqueeze(-1)).sum(dim=1)
             loss_soft_parent_kinematics = self._compute_parent_kinematics_loss(
                 pred_parent_p4,
-                target_parent_p4,
-                parent_weights,
+                {name: value[signal_mask] for name, value in target_parent_p4.items()},
+                parent_weights[signal_mask],
             )
         if self.loss_soft_parent_kinematics_weight > 0:
             total_loss = (

@@ -243,9 +243,9 @@ def log_all_kinematics_metrics(
         mode="ratio",
     )
 
-    # --- energy (derived from pt and theta) ---
-    pred_energy = pred_pt / np.clip(np.sin(pred_theta_rad), 1e-6, None)
-    true_energy = true_pt / np.clip(np.sin(true_theta_rad), 1e-6, None)
+    # --- energy ---
+    pred_energy = np.sqrt((pred_pt * np.cosh(pred_eta)) ** 2 + pred_m**2)
+    true_energy = np.sqrt((true_pt * np.cosh(true_eta)) ** 2 + true_m**2)
     _log_single_variable(
         pred_energy,
         true_energy,
