@@ -1,5 +1,7 @@
 import math
+from itertools import combinations
 import warnings
+from pathlib import Path
 from typing import Any
 
 import lightning as L
@@ -14,7 +16,7 @@ from mltau.tools.io.general import BatchInputs
 from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
 from mltau.tools.meson_classes import MesonClass, get_meson_classes
-from mltau.tools.partau_detr import decode_kinematics
+from mltau.tools.partau_detr import decode_kinematics, encode_p4, fraction_daughters
 
 try:  # scipy's LAPJVsp solver is ~10x faster than the pure-python fallback below
     from scipy.optimize import linear_sum_assignment as _scipy_lsa
@@ -233,6 +235,33 @@ class HungarianMatcher(nn.Module):
         self.object_class_index = object_class_index
         self.ignore_index = ignore_index
 
+    def cost_matrix(
+        self, pred_logits, pred_kinematics, pred_charge_logits,
+        pred_meson_class_logits, target_kinematics, target_charge_cls,
+        target_meson_class,
+    ):
+        difference = (pred_kinematics.float().unsqueeze(2) - target_kinematics.float().unsqueeze(1)).abs()
+        weights = self.kinematics_component_weights.to(difference)
+        if weights.numel() != difference.size(-1):
+            raise ValueError("Matcher kinematics component weights must match the target width")
+        obj_cost = -F.log_softmax(pred_logits.float(), dim=-1)[..., self.object_class_index]
+        kin_cost = (difference * weights).sum(-1)
+        charge_cost = _classification_cost_matrix(
+            pred_charge_logits, target_charge_cls, self.ignore_index,
+            self.classification_cost, self.classification_cost_clip,
+        )
+        meson_class_cost = _classification_cost_matrix(
+            pred_meson_class_logits, target_meson_class, self.ignore_index,
+            self.classification_cost, self.classification_cost_clip,
+        )
+        total = (
+            self.cost_objectness * obj_cost.unsqueeze(-1)
+            + self.cost_kinematics_l1 * kin_cost
+            + self.cost_charge_ce * charge_cost
+            + self.cost_meson_class_ce * meson_class_cost
+        )
+        return torch.nan_to_num(total, nan=0.0, posinf=1e4, neginf=-1e4), (obj_cost, kin_cost, charge_cost, meson_class_cost)
+
     @torch.no_grad()
     def forward(
         self,
@@ -277,45 +306,10 @@ class HungarianMatcher(nn.Module):
         # dtype mismatches. Roughly a dozen kernels per step instead of ~10 per
         # jet, and no host synchronisation until the single transfer below.
         # ------------------------------------------------------------------
-        obj_cost = -F.log_softmax(pred_logits.float(), dim=-1)[
-            ..., self.object_class_index
-        ]  # [B, Q]
-        # Weighted L1 by explicit broadcast: torch.cdist(p=1) has no fast kernel
-        # and could not apply per-component weights anyway.
-        component_diff = (
-            pred_kinematics.float().unsqueeze(2)
-            - target_kinematics.float().unsqueeze(1)
-        ).abs()  # [B, Q, T, K]
-        weights = self.kinematics_component_weights.to(component_diff.dtype)
-        if weights.numel() != component_diff.size(-1):
-            raise ValueError(
-                f"matcher.kinematics_component_weights has {weights.numel()} "
-                f"entries but the kinematics target has "
-                f"{component_diff.size(-1)} components."
-            )
-        kin_cost = (component_diff * weights).sum(-1)  # [B, Q, T]
-        charge_cost = _classification_cost_matrix(
-            pred_charge_logits,
-            target_charge_cls,
-            self.ignore_index,
-            self.classification_cost,
-            self.classification_cost_clip,
+        total_cost, (obj_cost, kin_cost, charge_cost, meson_class_cost) = self.cost_matrix(
+            pred_logits, pred_kinematics, pred_charge_logits, pred_meson_class_logits,
+            target_kinematics, target_charge_cls, target_meson_class,
         )
-        meson_class_cost = _classification_cost_matrix(
-            pred_meson_class_logits,
-            target_meson_class,
-            self.ignore_index,
-            self.classification_cost,
-            self.classification_cost_clip,
-        )
-
-        total_cost = (
-            self.cost_objectness * obj_cost.unsqueeze(-1)
-            + self.cost_kinematics_l1 * kin_cost
-            + self.cost_charge_ce * charge_cost
-            + self.cost_meson_class_ce * meson_class_cost
-        )
-        total_cost = torch.nan_to_num(total_cost, nan=0.0, posinf=1e4, neginf=-1e4)
         total_cost = total_cost.masked_fill(
             ~target_mask.unsqueeze(1), self._PAD_COST
         )
@@ -372,6 +366,60 @@ class HungarianMatcher(nn.Module):
         )
 
 
+    @torch.no_grad()
+    def match_closed_subsets(self, outputs, target_kinematics, target_charge_cls,
+                            target_meson_class, target_mask, reference):
+        """Try every target-sized subset, closing each before its Hungarian solve."""
+        device = target_mask.device
+        num_queries = outputs["pred_logits"].size(1)
+        selected = torch.zeros_like(outputs["pred_logits"][..., 0], dtype=torch.bool)
+        counts = target_mask.sum(-1)
+        if bool((counts > num_queries).any()):
+            raise ValueError("Cannot close a target set with fewer candidate queries than targets")
+        batches, queries, targets = [], [], []
+        self.last_cost_terms = {}
+        for count in range(1, num_queries + 1):
+            event_indices = (counts == count).nonzero(as_tuple=True)[0]
+            if event_indices.numel() == 0:
+                continue
+            target_slots = target_mask[event_indices].nonzero(as_tuple=True)[1].reshape(-1, count)
+            event_grid = event_indices[:, None]
+            best_cost = np.full(event_indices.numel(), np.inf)
+            best_queries = np.empty((event_indices.numel(), count), dtype=np.int64)
+            best_targets = np.empty_like(best_queries)
+            event_reference = {name: value[event_indices] for name, value in reference.items()}
+            for subset in combinations(range(num_queries), count):
+                query_slots = torch.tensor(subset, device=device)
+                p4 = fraction_daughters(
+                    outputs["pred_parent_p4"][event_indices],
+                    outputs["pred_fraction_coordinates"][event_grid, query_slots], close=True,
+                )
+                costs, _ = self.cost_matrix(
+                    outputs["pred_logits"][event_grid, query_slots], encode_p4(p4, event_reference).float(),
+                    outputs["pred_charge_logits"][event_grid, query_slots],
+                    outputs["pred_meson_class_logits"][event_grid, query_slots],
+                    target_kinematics[event_grid, target_slots],
+                    target_charge_cls[event_grid, target_slots],
+                    target_meson_class[event_grid, target_slots],
+                )
+                for event_index, cost in enumerate(costs.cpu().numpy()):
+                    rows, columns = _solve_assignment(cost)
+                    value = cost[rows, columns].sum()
+                    if value < best_cost[event_index]:
+                        best_cost[event_index] = value
+                        best_queries[event_index] = np.asarray(subset)[rows]
+                        best_targets[event_index] = columns
+            query_indices = torch.as_tensor(best_queries, device=device)
+            target_indices = target_slots.gather(1, torch.as_tensor(best_targets, device=device))
+            selected[event_grid, query_indices] = True
+            batches.append(event_grid.expand(-1, count).reshape(-1))
+            queries.append(query_indices.reshape(-1))
+            targets.append(target_indices.reshape(-1))
+        empty = torch.empty(0, dtype=torch.long, device=device)
+        pairs = tuple(torch.cat(parts) if parts else empty for parts in (batches, queries, targets))
+        return pairs, selected
+
+
 class SetCriterion(nn.Module):
     """
     DETR-style criterion: objectness + kinematics + charge + meson-class losses
@@ -420,9 +468,14 @@ class SetCriterion(nn.Module):
         object_class_index: int = 0,
         eos_coef: float = 0.1,
         ignore_index: int = -100,
+        detach_momentum_gate: bool = False,
+        parent_experiment: dict | None = None,
     ):
         super().__init__()
         self.matcher = matcher
+        self.detach_momentum_gate = detach_momentum_gate
+        self.parent_experiment = parent_experiment or {}
+        self.last_parent_diagnostics: dict[str, torch.Tensor] = {}
         self.tau_loss = tau_loss
         self.loss_objectness_weight = loss_objectness_weight
         self.loss_tau_id_weight = loss_tau_id_weight
@@ -507,7 +560,9 @@ class SetCriterion(nn.Module):
         pred_px, pred_py, pred_pz, pred_energy = pred_parent_p4.unbind(dim=-1)
         pred_pt = torch.sqrt((pred_px**2 + pred_py**2).clamp_min(1e-12))
         pred_eta = torch.asinh(pred_pz / pred_pt.clamp_min(1e-6))
-        pred_phi = torch.atan2(pred_py, pred_px)
+        pred_phi = torch.atan2(pred_py, torch.where(
+            (pred_px != 0) | (pred_py != 0), pred_px, torch.ones_like(pred_px)
+        ))
         pred_mass = torch.sqrt(
             torch.clamp(
                 pred_energy**2 - pred_px**2 - pred_py**2 - pred_pz**2,
@@ -639,6 +694,104 @@ class SetCriterion(nn.Module):
             diagnostics[f"momentum/{name}_pt_over_parent"] = signal_mean(pt / true_pt)
         return diagnostics
 
+    @torch.no_grad()
+    def _parent_experiment_diagnostics(
+        self, outputs, matched, selected, gate, target_mask, signal,
+        target_parent, reference, target_charge, target_decay_mode,
+    ) -> dict[str, torch.Tensor]:
+        p4 = outputs.get("pred_daughter_p4")
+        if p4 is None:
+            p4 = self._decode_predicted_p4(outputs["pred_kinematics"].double(), reference)
+        p4 = p4.double()
+        target = {name: value.double() for name, value in target_parent.items()}
+        truth_mass = (target["energy"].square() - (target["pt"] * target["eta"].cosh()).square()).clamp_min(1e-12).sqrt()
+
+        def residuals(momentum):
+            pt = momentum[..., :2].square().sum(-1).clamp_min(1e-24).sqrt()
+            mass = (momentum[..., 3].square() - momentum[..., :3].square().sum(-1)).clamp_min(1e-24).sqrt()
+            delta_phi = torch.atan2(momentum[..., 1], momentum[..., 0]) - target["phi"]
+            return torch.stack((
+                (pt / target["pt"].clamp_min(1e-6)).clamp_min(1e-12).log(),
+                (mass / truth_mass).clamp_min(1e-12).log(),
+                torch.asinh(momentum[..., 2] / pt) - target["eta"],
+                torch.atan2(delta_phi.sin(), delta_phi.cos()),
+            ), dim=-1)
+
+        union = (matched | selected).sum(-1)
+        iou = torch.where(union > 0, (matched & selected).sum(-1) / union.clamp_min(1), 1.0)
+        systems = {
+            "hungarian": (p4 * matched.unsqueeze(-1)).sum(1),
+            "hard_gate": (p4 * selected.unsqueeze(-1)).sum(1),
+            "soft_gate": (p4 * gate.unsqueeze(-1)).sum(1),
+            "all_components": p4.sum(1),
+        }
+        if self.parent_experiment.get("mode") == "closure":
+            selected_p4 = fraction_daughters(
+                outputs["pred_parent_p4"], outputs["pred_fraction_coordinates"],
+                close=True, active_mask=selected,
+            )
+            systems["hard_gate"] = selected_p4.sum(1)
+        if "pred_parent_p4" in outputs:
+            systems["direct"] = outputs["pred_parent_p4"]
+        if "target_daughter_sum_p4" in outputs:
+            systems["target_daughters"] = outputs["target_daughter_sum_p4"]
+
+        events = {"signal": signal.detach(), "hard_iou": iou}
+        max_queries = min(int(self.parent_experiment.get("oracle_max_queries", 8)), 12)
+        if p4.size(1) <= max_queries and self.parent_experiment.get("mode") != "closure":
+            subset_ids = torch.arange(2 ** p4.size(1), device=p4.device)
+            subsets = ((subset_ids[:, None] >> torch.arange(p4.size(1), device=p4.device)) & 1).bool()
+            best_cost = p4.new_full((p4.size(0),), float("inf"))
+            best_p4 = p4.new_zeros((p4.size(0), 4))
+            for subset in subsets:
+                candidate = (p4 * subset[None, :, None]).sum(1)
+                encoded = encode_p4(candidate, target)
+                zero = torch.zeros_like(encoded)
+                zero[:, 3] = 1
+                cost, _ = self.tau_loss._compute_kinematics_loss_per_sample(encoded, zero)
+                eligible = subset.sum() == target_mask.sum(-1)
+                better = eligible & (cost < best_cost)
+                best_cost = torch.where(better, cost, best_cost)
+                best_p4 = torch.where(better[:, None], candidate, best_p4)
+            systems["oracle_count_matched"] = best_p4
+            events["oracle_huber"] = best_cost
+
+        metrics = {}
+        def mean(values, mask=signal):
+            return values.masked_fill(~mask, 0).sum() / mask.sum().clamp_min(1)
+
+        for name, momentum in systems.items():
+            errors = residuals(momentum)
+            events[f"{name}_residuals"] = errors
+            for index, component in enumerate(("log_pt", "log_mass", "eta", "phi")):
+                values = errors[:, index]
+                metrics[f"experiment/{name}/{component}_bias"] = mean(values)
+                metrics[f"experiment/{name}/{component}_mae"] = mean(values.abs())
+                for label, subset in (("low_iou", iou < 0.5), ("high_iou", iou >= 0.5)):
+                    metrics[f"experiment/{name}/{component}_mae_{label}"] = mean(values.abs(), signal & subset)
+            encoded = encode_p4(momentum, target)
+            zero = torch.zeros_like(encoded)
+            zero[:, 3] = 1
+            huber, _ = self.tau_loss._compute_kinematics_loss_per_sample(encoded, zero)
+            events[f"{name}_huber"] = huber
+            metrics[f"experiment/{name}/huber"] = mean(huber)
+
+        metrics["experiment/low_iou_fraction"] = mean((iou < 0.5).double())
+        predicted_charge = outputs["pred_charge_logits"].argmax(-1) - 1
+        for name, mask in (("hungarian", matched), ("hard_gate", selected)):
+            charge = (predicted_charge * mask).sum(-1)
+            charged = ((predicted_charge != 0) & mask).sum(-1)
+            neutral = ((predicted_charge == 0) & mask).sum(-1)
+            mode = 5 * (charged - 1) + neutral
+            metrics[f"experiment/{name}/charge_agreement"] = mean((charge == target_charge).double())
+            metrics[f"experiment/{name}/charge_count_decay_mode_agreement"] = mean(((mode == target_decay_mode) & (charged > 0)).double())
+        if "pred_parent_p4" in outputs:
+            relative_closure = (p4.sum(1) - outputs["pred_parent_p4"]).abs().amax(-1) / outputs["pred_parent_p4"][:, 3].clamp_min(1e-12)
+            metrics["experiment/closure_relative_max_component"] = mean(relative_closure)
+            metrics["experiment/unmatched_energy_fraction"] = mean((p4[..., 3] * ~matched).sum(1) / p4[..., 3].sum(1).clamp_min(1e-12))
+        self.last_parent_diagnostics = {name: value.detach() for name, value in events.items()}
+        return metrics
+
     def _compute_parent_charge_loss(
         self,
         charge_probabilities: torch.Tensor,
@@ -718,16 +871,30 @@ class SetCriterion(nn.Module):
         # actual mix is set by dataset.max_jets_per_sample and, for the tauID
         # loss, by cls_weight; do not assume a ratio here.)
         match_mask = target_mask & signal_mask.unsqueeze(1)
-        pair_b, pair_q, pair_t = self.matcher(
-            pred_logits=pred_logits,
-            pred_kinematics=pred_kinematics,
-            pred_charge_logits=pred_charge_logits,
-            pred_meson_class_logits=pred_meson_class_logits,
-            target_kinematics=target_kinematics,
-            target_charge_cls=target_charge_cls,
-            target_meson_class=target_meson_class,
-            target_mask=match_mask,
-        )
+        if self.parent_experiment.get("mode") == "closure":
+            pairs, active_mask = self.matcher.match_closed_subsets(
+                outputs, target_kinematics, target_charge_cls,
+                target_meson_class, match_mask, kinematics_reference_p4,
+            )
+            pair_b, pair_q, pair_t = pairs
+            outputs = dict(outputs)
+            outputs["pred_daughter_p4"] = fraction_daughters(
+                outputs["pred_parent_p4"], outputs["pred_fraction_coordinates"],
+                close=True, active_mask=active_mask,
+            )
+            pred_kinematics = encode_p4(outputs["pred_daughter_p4"], kinematics_reference_p4).float()
+            outputs["pred_kinematics"] = pred_kinematics
+        else:
+            pair_b, pair_q, pair_t = self.matcher(
+                pred_logits=pred_logits,
+                pred_kinematics=pred_kinematics,
+                pred_charge_logits=pred_charge_logits,
+                pred_meson_class_logits=pred_meson_class_logits,
+                target_kinematics=target_kinematics,
+                target_charge_cls=target_charge_cls,
+                target_meson_class=target_meson_class,
+                target_mask=match_mask,
+            )
         num_matched = pair_b.numel()
 
         tgt_classes = torch.full(
@@ -828,6 +995,31 @@ class SetCriterion(nn.Module):
             + self.loss_charge_weight * loss_charge
             + self.loss_meson_class_weight * loss_meson_class
         )
+        daughter_loss = total_loss - self.loss_tau_id_weight * loss_tau_id
+        use_hungarian_losses = self.parent_experiment.get("hungarian_losses", True)
+        if not use_hungarian_losses:
+            total_loss = self.loss_tau_id_weight * loss_tau_id
+
+        experiment_losses = {}
+        if "pred_parent_p4" in outputs:
+            direct_loss = self._compute_parent_kinematics_loss(
+                outputs["pred_parent_p4"], target_parent_p4, signal_mask
+            )
+            total_loss = total_loss + self.parent_experiment.get("weight_direct", 1.0) * direct_loss
+            experiment_losses["experiment/loss_direct_parent"] = direct_loss
+            experiment_losses["experiment/loss_daughter"] = daughter_loss
+            if "pred_daughter_p4" in outputs:
+                parent = outputs["pred_parent_p4"]
+                parent_pt = parent[:, :2].square().sum(-1).clamp_min(1e-24).sqrt()
+                predicted_reference = {
+                    "pt": parent_pt, "eta": torch.asinh(parent[:, 2] / parent_pt),
+                    "phi": torch.atan2(parent[:, 1], parent[:, 0]), "energy": parent[:, 3],
+                }
+                closure_loss = self._compute_parent_kinematics_loss(
+                    outputs["pred_daughter_p4"].sum(1), predicted_reference, signal_mask
+                )
+                total_loss = total_loss + self.parent_experiment.get("weight_closure", 0.0) * closure_loss
+                experiment_losses["experiment/loss_closure"] = closure_loss
 
         # ---- Auxiliary penalties ----
         loss_consistency = pred_logits.new_zeros(())
@@ -897,10 +1089,11 @@ class SetCriterion(nn.Module):
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_parent_kinematics_weight > 0
         ):
-            pred_p4 = self._decode_predicted_p4(
-                pred_kinematics[pair_b, pair_q],
-                kinematics_reference_p4,
-                pair_b,
+            pred_p4 = (
+                outputs["pred_daughter_p4"][pair_b, pair_q]
+                if "pred_daughter_p4" in outputs else self._decode_predicted_p4(
+                    pred_kinematics[pair_b, pair_q], kinematics_reference_p4, pair_b
+                )
             )
             pred_parent_p4 = pred_p4.new_zeros((batch_size, 4)).index_add(0, pair_b, pred_p4)
             loss_parent_kinematics = self._compute_parent_kinematics_loss(
@@ -908,7 +1101,7 @@ class SetCriterion(nn.Module):
                 target_parent_p4,
                 parent_weights,
             )
-        if self.loss_parent_kinematics_weight > 0:
+        if self.loss_parent_kinematics_weight > 0 and use_hungarian_losses:
             total_loss = total_loss + self.loss_parent_kinematics_weight * loss_parent_kinematics
 
         with torch.set_grad_enabled(
@@ -931,7 +1124,7 @@ class SetCriterion(nn.Module):
                 signal_mask,
                 parent_weights,
             )
-        if self.loss_parent_charge_weight > 0:
+        if self.loss_parent_charge_weight > 0 and use_hungarian_losses:
             total_loss = total_loss + self.loss_parent_charge_weight * loss_parent_charge
 
         with torch.set_grad_enabled(
@@ -982,7 +1175,7 @@ class SetCriterion(nn.Module):
                 ignore_index=self.ignore_index,
             )
             loss_parent_decay_mode = self._weighted_mean(decay_mode_loss, parent_weights)
-        if self.loss_parent_decay_mode_weight > 0:
+        if self.loss_parent_decay_mode_weight > 0 and use_hungarian_losses:
             total_loss = total_loss + self.loss_parent_decay_mode_weight * loss_parent_decay_mode
 
         # Soft constraints use every query, weighted by a smooth version of the
@@ -1018,6 +1211,12 @@ class SetCriterion(nn.Module):
                 soft_query_weights, target_mask, signal_mask,
                 target_parent_p4, kinematics_reference_p4,
             )
+            if self.parent_experiment.get("diagnostics", False):
+                matching_diagnostics.update(self._parent_experiment_diagnostics(
+                    outputs, matched_query_mask, hard_query_mask, soft_query_weights,
+                    target_mask, signal_mask, target_parent_p4, kinematics_reference_p4,
+                    target_parent_charge, target_parent_decay_mode,
+                ))
         count_match = hard_query_mask.sum(dim=1) == target_mask.sum(dim=1)
         eligible = signal_mask & count_match
         count_match_fraction = eligible.sum().to(pred_logits.dtype) / (
@@ -1027,11 +1226,12 @@ class SetCriterion(nn.Module):
         with torch.set_grad_enabled(
             torch.is_grad_enabled() and self.loss_soft_parent_kinematics_weight > 0
         ):
-            pred_p4 = self._decode_predicted_p4(
-                pred_kinematics,
-                kinematics_reference_p4,
+            pred_p4 = (
+                outputs["pred_daughter_p4"] if "pred_daughter_p4" in outputs
+                else self._decode_predicted_p4(pred_kinematics, kinematics_reference_p4)
             )
-            pred_parent_p4 = (pred_p4 * soft_query_weights.unsqueeze(-1)).sum(dim=1)
+            momentum_gate = soft_query_weights.detach() if self.detach_momentum_gate else soft_query_weights
+            pred_parent_p4 = (pred_p4 * momentum_gate.unsqueeze(-1)).sum(dim=1)
             loss_soft_parent_kinematics = self._compute_parent_kinematics_loss(
                 pred_parent_p4,
                 target_parent_p4,
@@ -1154,6 +1354,7 @@ class SetCriterion(nn.Module):
                 pred_logits.dtype
             ),
             **matching_diagnostics,
+            **experiment_losses,
             **{k: pred_logits.new_tensor(v) for k, v in self.matcher.last_cost_terms.items()},
         }
 
@@ -1201,6 +1402,7 @@ class ParTauDETRModule(L.LightningModule):
         arch = cfg.model
         encoder_cfg = arch.encoder
         detr_cfg = arch.detr
+        parent_experiment = dict(detr_cfg.get("parent_experiment", {}))
 
         num_charge_classes = int(arch.num_charge_classes)
         if num_charge_classes != 3:
@@ -1266,6 +1468,7 @@ class ParTauDETRModule(L.LightningModule):
             head_dropout=float(detr_cfg.head_dropout),
             for_inference=False,
             use_amp=False,
+            parent_mode=str(parent_experiment.get("mode", "baseline")),
         )
 
         self.matcher = HungarianMatcher(
@@ -1310,6 +1513,8 @@ class ParTauDETRModule(L.LightningModule):
             object_class_index=0,
             eos_coef=float(detr_cfg.loss.eos_coef),
             ignore_index=self.ignore_index,
+            detach_momentum_gate=bool(detr_cfg.loss.get("detach_momentum_gate", False)),
+            parent_experiment=parent_experiment,
         )
 
         # Starting value and fallback for the objectness threshold; the
@@ -1520,7 +1725,11 @@ class ParTauDETRModule(L.LightningModule):
             cand_features=inputs.cand_features,
             cand_kinematics_pxpypze=inputs.cand_kinematics_pxpypze,
             cand_mask=inputs.cand_mask,
+            kinematics_reference_p4=inputs.reco_jet_p4s,
+            objectness_threshold=self.score_threshold_calibrated,
         )
+        if self.criterion.parent_experiment.get("diagnostics", False) and "particles_p4" in inputs.target:
+            outputs["target_daughter_sum_p4"] = inputs.target["particles_p4"].double().sum(1)
         return (
             outputs,
             inputs.target,
@@ -1695,7 +1904,7 @@ class ParTauDETRModule(L.LightningModule):
         for key, value in losses.items():
             if key.startswith("cost/"):
                 self.log(key, value, on_step=False, on_epoch=True)
-            elif key.startswith(("matching/", "momentum/")):
+            elif key.startswith(("matching/", "momentum/", "experiment/")):
                 self.log(f"train/{key}", value, on_step=True, on_epoch=True)
         self.log("counts/num_charge_supervised", losses["num_charge_supervised"],
                  on_step=False, on_epoch=True)
@@ -1847,6 +2056,7 @@ class ParTauDETRModule(L.LightningModule):
             pdg=repr_pdg[outputs["pred_meson_class_logits"].argmax(-1)],
             valid=scores >= float(self.score_threshold_calibrated),
             reco_jet=reco_jet,
+            physical_p4=outputs.get("pred_daughter_p4"),
         )
         # Padded slots carry ignore_index; clamp before the lookup and let the
         # mask decide what counts.
@@ -2054,8 +2264,17 @@ class ParTauDETRModule(L.LightningModule):
             on_epoch=True,
         )
         for key, value in losses.items():
-            if key.startswith(("matching/", "momentum/")):
+            if key.startswith(("matching/", "momentum/", "experiment/")):
                 self.log(f"val/{key}", value, on_step=False, on_epoch=True)
+
+        diagnostic_dir = self.criterion.parent_experiment.get("diagnostic_dir")
+        if diagnostic_dir and self.criterion.parent_experiment.get("diagnostics", False) and not self.trainer.sanity_checking:
+            destination = Path(diagnostic_dir) / f"epoch_{self.current_epoch}" / f"rank_{self.global_rank}"
+            destination.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {name: value.detach().cpu() for name, value in self.criterion.last_parent_diagnostics.items()},
+                destination / f"batch_{_batch_idx}.pt",
+            )
 
         if not self.trainer.sanity_checking:
             self._accumulate_jet_level(batch, outputs, targets)
@@ -2247,6 +2466,9 @@ class ParTauDETRModule(L.LightningModule):
             "pred_charge": pred_charge,
             "pred_meson_class": meson_class,
         }
+        for name in ("pred_parent_p4", "pred_daughter_p4", "pred_fraction_coordinates", "pred_active_mask"):
+            if name in outputs:
+                result[name] = outputs[name]
 
         if "is_tau" in outputs:
             result["is_tau_logits"] = outputs["is_tau"]

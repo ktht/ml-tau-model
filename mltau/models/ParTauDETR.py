@@ -4,6 +4,7 @@ import torch
 from torch import nn
 
 from mltau.models.ParticleTransformer import ParticleTransformer
+from mltau.tools.partau_detr import decode_kinematics, encode_p4, fraction_daughters
 
 
 class ParTauDETR(ParticleTransformer):
@@ -65,6 +66,7 @@ class ParTauDETR(ParticleTransformer):
         append_global_token: bool = True,
         return_memory: bool = False,
         return_cls: bool = False,
+        parent_mode: str = "baseline",
         **kwargs,
     ):
         super().__init__(
@@ -96,6 +98,9 @@ class ParTauDETR(ParticleTransformer):
         self.return_memory = return_memory
         self.return_cls = return_cls
         self.tau_id_head = tau_id_head
+        if parent_mode not in ("baseline", "direct", "fractions", "closure"):
+            raise ValueError("parent_mode must be baseline, direct, fractions or closure")
+        self.parent_mode = parent_mode
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
         decoder_heads = (
@@ -142,6 +147,14 @@ class ParTauDETR(ParticleTransformer):
             )
         else:
             self.tau_head = None
+
+        if parent_mode != "baseline":
+            self.parent_head = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, 5)
+            )
+        if parent_mode in ("fractions", "closure"):
+            self.fraction_head = nn.Linear(embed_dim, 4)
+            self.kinematics_head.requires_grad_(False)
 
     @torch.jit.ignore()
     def no_weight_decay(self):
@@ -222,6 +235,8 @@ class ParTauDETR(ParticleTransformer):
         cand_features: torch.Tensor,
         cand_kinematics_pxpypze: torch.Tensor | None = None,
         cand_mask: torch.Tensor | None = None,
+        kinematics_reference_p4: dict[str, torch.Tensor] | None = None,
+        objectness_threshold: torch.Tensor | float = 0.5,
     ):
         if cand_mask is None:
             raise ValueError(
@@ -239,6 +254,7 @@ class ParTauDETR(ParticleTransformer):
 
             need_global_token = (
                 self.append_global_token or self.tau_id_head or self.return_cls
+                or self.parent_mode != "baseline"
             )
             global_token = (
                 self.compute_global_token(particle_memory, padding_mask)
@@ -270,6 +286,38 @@ class ParTauDETR(ParticleTransformer):
                 "pred_charge_logits": self.charge_head(hs),
                 "pred_meson_class_logits": self.meson_class_head(hs),
             }
+
+            if self.parent_mode != "baseline":
+                if kinematics_reference_p4 is None or global_token is None:
+                    raise ValueError("Parent experiments require reconstructed jet references")
+                parent_kinematics = self.parent_head(global_token.squeeze(0))
+                output["pred_parent_kinematics"] = parent_kinematics
+                bounded_kinematics = parent_kinematics.double().clone()
+                reference_eta = kinematics_reference_p4["eta"].double()
+                bounded_kinematics[:, 1] = (bounded_kinematics[:, 1] + reference_eta).clamp(-10, 10) - reference_eta
+                parent_p4 = decode_kinematics(
+                    bounded_kinematics,
+                    *(kinematics_reference_p4[name].double() for name in ("pt", "eta", "phi", "energy")),
+                    clamp_log_ratios=True,
+                )
+                momentum_norm = parent_p4[:, :3].square().sum(-1).sqrt()
+                mass = (parent_p4[:, 3].square() - momentum_norm.square()).clamp_min(1e-6).sqrt()
+                mass = torch.maximum(mass, momentum_norm * 1e-4)
+                parent_p4 = torch.cat((parent_p4[:, :3], torch.hypot(momentum_norm, mass).unsqueeze(-1)), dim=-1)
+                output["pred_parent_p4"] = parent_p4
+                if self.parent_mode in ("fractions", "closure"):
+                    coordinates = self.fraction_head(hs)
+                    active_mask = None
+                    if self.parent_mode == "closure":
+                        active_mask = output["pred_logits"].float().softmax(-1)[..., 0] >= objectness_threshold
+                        output["pred_active_mask"] = active_mask
+                    daughter_p4 = fraction_daughters(
+                        parent_p4, coordinates, close=self.parent_mode == "closure",
+                        active_mask=active_mask,
+                    )
+                    output["pred_fraction_coordinates"] = coordinates
+                    output["pred_daughter_p4"] = daughter_p4
+                    output["pred_kinematics"] = encode_p4(daughter_p4, kinematics_reference_p4).float()
 
             # Jet-level tau-tagging logits from the pooled global token.
             if self.tau_head is not None and global_token is not None:

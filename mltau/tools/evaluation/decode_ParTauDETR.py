@@ -12,6 +12,7 @@ from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 from mltau.tools.partau_detr import decode_kinematics as decode_kinematics_p4
+from mltau.tools.partau_detr import fraction_daughters
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -101,7 +102,7 @@ def _assign(
     return pred_idx[valid].astype(np.int64), true_idx[valid].astype(np.int64)
 
 
-def _predicted_components(outputs, reco_jet_p4s):
+def _predicted_components(outputs, reco_jet_p4s, objectness_threshold=None):
     """
     Dense [N, Q] predictions, before any objectness threshold is applied.
 
@@ -119,13 +120,20 @@ def _predicted_components(outputs, reco_jet_p4s):
 
     pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
 
-    pred_p4_tensor = decode_kinematics_p4(
-        outputs["pred_kinematics"],
-        reco_jet_p4s["pt"],
-        reco_jet_p4s["eta"],
-        reco_jet_p4s["phi"],
-        reco_jet_p4s["energy"],
-    )
+    pred_p4_tensor = outputs.get("pred_daughter_p4")
+    if "pred_active_mask" in outputs and objectness_threshold is not None:
+        pred_p4_tensor = fraction_daughters(
+            outputs["pred_parent_p4"], outputs["pred_fraction_coordinates"],
+            close=True, active_mask=pred_scores >= objectness_threshold,
+        )
+    if pred_p4_tensor is None:
+        pred_p4_tensor = decode_kinematics_p4(
+            outputs["pred_kinematics"],
+            reco_jet_p4s["pt"],
+            reco_jet_p4s["eta"],
+            reco_jet_p4s["phi"],
+            reco_jet_p4s["energy"],
+        )
     pred_p4 = p4_from_components(pred_p4_tensor)
     return pred_scores, pred_p4, pred_charge, pred_meson_class
 
@@ -156,7 +164,7 @@ def get_predicted_particles(
     restricted to true tau jets, where the tagger has nothing to add.
     """
     pred_scores, pred_p4, pred_charge, pred_meson_class = _predicted_components(
-        outputs, reco_jet_p4s
+        outputs, reco_jet_p4s, objectness_threshold=obj_cls_trsh
     )
     pred_mask = pred_scores >= obj_cls_trsh
     if tau_scores is not None and tau_threshold is not None:
@@ -509,6 +517,10 @@ def scan_thresholds(
     n_events = scores.shape[0]
     f1_scores = []
     for obj_cls_trsh in tqdm.tqdm(thresholds, desc="threshold scan", unit="point"):
+        if "pred_active_mask" in outputs:
+            _, subset_p4, _, _ = _predicted_components(outputs, reco_jet_p4s, objectness_threshold=obj_cls_trsh)
+            p_eta = ak.to_numpy(subset_p4.eta)
+            p_phi = ak.to_numpy(subset_p4.phi)
         keep = scores >= obj_cls_trsh  # [N, Q]
         n_pred = keep.sum(axis=1)
         n_matched = np.zeros(n_events, dtype=np.int64)

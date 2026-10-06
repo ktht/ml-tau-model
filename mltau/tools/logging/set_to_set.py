@@ -181,7 +181,7 @@ def decay_modes(pdg: np.ndarray, valid: np.ndarray) -> dict:
     }
 
 
-def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
+def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, physical_p4=None):
     """
     Collapse a set of daughters into per-jet quantities.
 
@@ -215,6 +215,8 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     # target. The tau mass is then still non-zero, as it comes from the opening
     # angles between the daughters.
     energy = (pt * torch.cosh(eta) * mask).sum(-1)
+    if physical_p4 is not None:
+        px, py, pz, energy = (physical_p4 * valid.unsqueeze(-1)).sum(1).unbind(-1)
 
     pt_tau = torch.sqrt(px**2 + py**2 + eps)
     eta_tau = torch.asinh(pz / pt_tau)

@@ -86,6 +86,14 @@ model:
         append_global_token: true
         tau_id_head: true
         head_dropout: 0.1
+        parent_experiment:
+            mode: baseline
+            weight_direct: 1.0
+            weight_closure: 0.0
+            hungarian_losses: true
+            diagnostics: false
+            diagnostic_dir: null
+            oracle_max_queries: 8
         matcher:
             cost_objectness: 1.0
             cost_kinematics_l1: 2.0
@@ -143,6 +151,7 @@ model:
             weight_soft_parent_charge: 1.0
             weight_soft_parent_decay_mode: 1.0
             parent_objectness_temperature: 0.1
+            detach_momentum_gate: false
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
             # queries the two sides carry equal total weight at

@@ -448,6 +448,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
                 ak.to_numpy(data.gen_jet_tau_decaymode).astype(np.int64)
             ),
         }
+        if self.cfg.model.detr.get("parent_experiment", {}).get("diagnostics", False):
+            targets["particles_p4"] = torch.from_numpy(daughter_p4_np).float()
 
         return self._scaled((
             torch.from_numpy(cand_features_np),
