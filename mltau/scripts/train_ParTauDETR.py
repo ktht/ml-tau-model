@@ -317,6 +317,7 @@ def measure_inference_time(model, datamodule, cfg, device, max_batches: int = 20
         pass
 
     forward_seconds = 0.0
+    reconstruction_seconds = 0.0
     loop_start = None
     jets = 0
     batches = 0
@@ -336,11 +337,19 @@ def measure_inference_time(model, datamodule, cfg, device, max_batches: int = 20
                 batch = _move_batch(batch, device)
                 _sync()
                 started = time.perf_counter()
-                model.forward(batch)
+                outputs, _, _, _, reference = model.forward(batch)
                 _sync()
                 elapsed = time.perf_counter() - started
+                started_reconstruction = time.perf_counter()
+                selected = outputs["pred_logits"].float().softmax(-1)[..., 0] >= model.score_threshold_calibrated
+                if "is_tau" in outputs:
+                    selected = selected & (outputs["is_tau"].float().softmax(-1)[:, 1] >= model.tau_id_threshold)[:, None]
+                model._reconstruct(outputs, reference, selected)
+                _sync()
+                reconstruction_elapsed = time.perf_counter() - started_reconstruction
                 if index >= warmup_batches:
                     forward_seconds += elapsed
+                    reconstruction_seconds += reconstruction_elapsed
                     jets += int(batch[0].shape[0])
                     batches += 1
                 if batches >= max_batches:
@@ -364,6 +373,8 @@ def measure_inference_time(model, datamodule, cfg, device, max_batches: int = 20
         "forward_ms_per_batch": round(forward_seconds / batches * 1e3, 3),
         "forward_us_per_jet": round(forward_seconds / jets * 1e6, 3),
         "forward_jets_per_second": round(jets / forward_seconds, 1),
+        "reconstruction_us_per_jet": round(reconstruction_seconds / jets * 1e6, 3),
+        "forward_and_reconstruction_us_per_jet": round((forward_seconds + reconstruction_seconds) / jets * 1e6, 3),
         "end_to_end_seconds_total": round(end_to_end, 4),
         "end_to_end_jets_per_second": round(jets / end_to_end, 1),
         # < 1 means the loop spends most of its time waiting for data.
@@ -681,7 +692,10 @@ def train(cfg: DictConfig):
         accelerator=check_accelerator(cfg),
         devices=cfg.training.trainer.devices,
         precision=str(cfg.training.trainer.precision),
-        gradient_clip_val=float(cfg.training.trainer.get("gradient_clip_val", 1.0)),
+        gradient_clip_val=(
+            None if model.pcgrad_enabled
+            else float(cfg.training.trainer.get("gradient_clip_val", 1.0))
+        ),
         gradient_clip_algorithm="norm",
         num_sanity_val_steps=cfg.training.trainer.num_sanity_val_steps,
         enable_progress_bar=True,

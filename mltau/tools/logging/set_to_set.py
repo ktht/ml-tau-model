@@ -181,7 +181,7 @@ def decay_modes(pdg: np.ndarray, valid: np.ndarray) -> dict:
     }
 
 
-def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
+def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, p4=None):
     """
     Collapse a set of daughters into per-jet quantities.
 
@@ -201,22 +201,20 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     eta_jet = reco_jet["eta"]
     phi_jet = reco_jet["phi"]
 
-    pt = torch.exp(kin[..., 0]) * pt_jet[:, None]
-    eta = kin[..., 1] + eta_jet[:, None]
-    phi = phi_jet[:, None] + torch.atan2(kin[..., 2], kin[..., 3])
+    if p4 is None:
+        pt = torch.exp(kin[..., 0]) * pt_jet[:, None]
+        eta = kin[..., 1] + eta_jet[:, None]
+        phi = phi_jet[:, None] + torch.atan2(kin[..., 2], kin[..., 3])
+        mask = valid.to(pt.dtype)
+        px = (pt * torch.cos(phi) * mask).sum(-1)
+        py = (pt * torch.sin(phi) * mask).sum(-1)
+        pz = (pt * torch.sinh(eta) * mask).sum(-1)
+        energy = (pt * torch.cosh(eta) * mask).sum(-1)
+    else:
+        summed = p4.masked_fill(~valid[..., None], 0).sum(1)
+        px, py, pz, energy = summed.unbind(-1)
 
-    mask = valid.to(pt.dtype)
-    px = (pt * torch.cos(phi) * mask).sum(-1)
-    py = (pt * torch.sin(phi) * mask).sum(-1)
-    pz = (pt * torch.sinh(eta) * mask).sum(-1)
-    # Daughters are treated as massless in the sum: at these momenta a pion's
-    # mass is ~0.01% of its energy, and using the predicted log-mass instead
-    # would make the tau energy depend on the least determined component of the
-    # target. The tau mass is then still non-zero, as it comes from the opening
-    # angles between the daughters.
-    energy = (pt * torch.cosh(eta) * mask).sum(-1)
-
-    pt_tau = torch.sqrt(px**2 + py**2 + eps)
+    pt_tau = torch.hypot(px, py).clamp_min(eps)
     eta_tau = torch.asinh(pz / pt_tau)
     phi_tau = torch.atan2(py, px)
     mass_tau = torch.sqrt(torch.clamp(energy**2 - (px**2 + py**2 + pz**2), min=0.0))

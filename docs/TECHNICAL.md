@@ -32,6 +32,63 @@ Four task-specific CLS tokens independently attend to the shared backbone output
   - Kinematics: Combined loss using `HuberLoss(δ=1.0)` for $p_T$, $\eta$, and $m$, plus a chord loss (L2 distance) for the $(\sin\phi, \cos\phi)$ vector. The mass component is weighted by $\lambda_m = 0.2$.
 - **Conditional gating**: Auxiliary losses (charge, decay mode, kinematics) are multiplied by the truth tau label, so only signal jets contribute to those tasks.
 
+## Parent-First ParTauDETR
+
+ParTauDETR has a dedicated parent kinematics token and readout, using the
+MultiParTau five-component jet-relative convention. Daughter heads retain their
+existing representation. Training supervises raw outputs only; no conservation
+solver or differentiation through its scale runs in the training objective.
+
+Configuration is in `main_ParTauDETR.yaml`:
+
+- `model.detr.regression_query_selection`: `matched` (default) or `threshold`.
+  Threshold mode rematches selected queries to truth for daughter regression.
+  All-query objectness, charge, and meson-class supervision remains independent.
+- `model.detr.pcgrad`: enabled by default. Manual optimization projects tau-ID
+  and daughter task gradients while leaving parent-kinematics gradients intact,
+  following MultiParTau's per-parameter projection convention. Gradient
+  accumulation must be one. The training entry point disables Trainer clipping
+  in this mode; the module clips merged gradients after precision unscaling.
+- `model.parent_tau_loss`: separate parent loss scales and component weights.
+- `model.detr.loss.weight_parent_p4`: direct parent regression weight.
+- `model.detr.loss.weight_mass_feasibility_daughters`: defaults to one.
+- `model.detr.loss.weight_mass_feasibility_parent`: defaults to zero.
+  The feasibility terms use the squared positive log ratio of summed daughter
+  masses to parent mass, detaching the opposite prediction in each term.
+
+True single-daughter events skip daughter kinematic matching costs, regression,
+and feasibility penalties; objectness, charge, class, and parent losses remain.
+Matched and soft daughter-sum parent kinematics constraints have been removed.
+Parent charge and decay-mode constraints are retained.
+
+Inference uses threshold-selected queries. One selected daughter receives the
+parent four-vector directly, preserving its charge and class. For multiple
+daughters, a common boost takes them into the parent rest frame, their spatial
+momenta are centered, and bisection finds the common scale that makes their
+on-shell energies sum to the parent mass. Boosting back preserves closure and
+the predicted daughter masses. The batched solver uses float64 arithmetic;
+iteration count and closure tolerances are configured under `model.detr.inference`.
+
+`predict_step` returns corrected `pred_p4` and `pred_kinematics`, raw counterparts,
+`pred_parent_p4`, and derived `decomposition_valid`, `decomposition_reason`, and
+`decomposition_scale`. Reason codes index `DECOMPOSITION_REASONS`: valid, empty,
+invalid parent, invalid daughters, mass budget exceeded, zero centered momenta,
+numerical failure, and not tagged. Invalid decompositions retain raw daughters;
+the parent is never silently adjusted. Rejected jets have empty output masks.
+
+Training and validation log `parent_p4`, all four parent kinematics loss
+components, `mass_feasibility_daughters`, and `mass_feasibility_parent` under
+their respective loss namespaces. Validation also logs decomposition reasons
+and mean valid multi-daughter scale, and compares corrected, raw, and directly
+predicted parent observables under `val_jet`, `val_jet_raw`, and `val_jet_parent`.
+Threshold calibration continues to use raw daughter predictions.
+The post-training timing helper reports reconstruction time separately from
+network forward time; neither benchmark is part of the training loss.
+
+This architecture requires new training: old DETR checkpoints do not contain
+the parent token/readout. They are not inference-compatible with the new model.
+Synthetic tests are in `tests/test_partau_conservation.py`; they do not need data.
+
 ## Input Features
 
 17 features per candidate particle:

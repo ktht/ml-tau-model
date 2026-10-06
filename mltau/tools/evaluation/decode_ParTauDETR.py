@@ -12,6 +12,7 @@ from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 from mltau.tools.partau_detr import decode_kinematics as decode_kinematics_p4
+from mltau.tools.partau_detr import reconstruct_daughters
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -28,10 +29,10 @@ def p4_from_components(components: torch.Tensor) -> ak.Array:
     return vector.awk(
         ak.zip(
             {
-                "px": components[..., 0],
-                "py": components[..., 1],
-                "pz": components[..., 2],
-                "energy": components[..., 3],
+                "px": components[..., 0].detach().cpu().numpy(),
+                "py": components[..., 1].detach().cpu().numpy(),
+                "pz": components[..., 2].detach().cpu().numpy(),
+                "energy": components[..., 3].detach().cpu().numpy(),
             }
         )
     )
@@ -120,7 +121,7 @@ def _predicted_components(outputs, reco_jet_p4s):
     pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
 
     pred_p4_tensor = decode_kinematics_p4(
-        outputs["pred_kinematics"],
+        outputs.get("pred_raw_kinematics", outputs["pred_kinematics"]),
         reco_jet_p4s["pt"],
         reco_jet_p4s["eta"],
         reco_jet_p4s["phi"],
@@ -143,6 +144,7 @@ def get_predicted_particles(
     obj_cls_trsh: float = 0.5,
     tau_scores=None,
     tau_threshold: float | None = None,
+    reconstruction_options: dict | None = None,
 ):
     """
     Predicted daughters per jet: the queries whose objectness passes
@@ -163,9 +165,16 @@ def get_predicted_particles(
         tagged = torch.as_tensor(tau_scores).to(pred_mask.device) >= tau_threshold
         pred_mask = pred_mask & tagged[:, None]
 
-    pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
-    pred_charge = ak.drop_none(ak.mask(pred_charge, pred_mask))
-    pred_meson_class = ak.drop_none(ak.mask(pred_meson_class, pred_mask))
+    if "pred_parent_kinematics" in outputs:
+        raw_outputs = {**outputs, "pred_kinematics": outputs.get("pred_raw_kinematics", outputs["pred_kinematics"])}
+        reconstruction = reconstruct_daughters(
+            raw_outputs, reco_jet_p4s, pred_mask, **(reconstruction_options or {})
+        )
+        pred_p4 = p4_from_components(reconstruction["p4"])
+    mask_numpy = _to_numpy(pred_mask)
+    pred_p4 = ak.drop_none(ak.mask(pred_p4, mask_numpy))
+    pred_charge = ak.drop_none(ak.mask(_to_numpy(pred_charge), mask_numpy))
+    pred_meson_class = ak.drop_none(ak.mask(_to_numpy(pred_meson_class), mask_numpy))
     return pred_p4, pred_charge, pred_meson_class
 
 
@@ -421,6 +430,11 @@ def create_predictions(
         obj_cls_trsh=obj_cls_trsh,
         tau_scores=tau_scores(outputs) if tau_threshold is not None else None,
         tau_threshold=tau_threshold,
+        reconstruction_options={
+            "iterations": int(cfg.model.detr.inference.get("conservation_iterations", 48)),
+            "atol": float(cfg.model.detr.inference.get("conservation_atol", 1e-8)),
+            "rtol": float(cfg.model.detr.inference.get("conservation_rtol", 1e-7)),
+        },
     )
     true_daughters = TauDaughter(*targets)
     pred_daughters = TauDaughter(*predictions)

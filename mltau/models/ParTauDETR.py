@@ -3,7 +3,7 @@ import contextlib
 import torch
 from torch import nn
 
-from mltau.models.ParticleTransformer import ParticleTransformer
+from mltau.models.ParticleTransformer import ParticleTransformer, trunc_normal_
 
 
 class ParTauDETR(ParticleTransformer):
@@ -23,6 +23,7 @@ class ParTauDETR(ParticleTransformer):
 
     Jet-level head:
       - is_tau: binary tau-tagging logits from the pooled global token.
+            - pred_parent_kinematics: visible-tau regression from its own task token.
     """
 
     def __init__(
@@ -128,6 +129,13 @@ class ParTauDETR(ParticleTransformer):
         )
         self.charge_head = nn.Linear(embed_dim, num_charge_classes)
         self.meson_class_head = nn.Linear(embed_dim, num_meson_classes)
+        self.cls_token_kinematics = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        trunc_normal_(self.cls_token_kinematics, std=0.02)
+        self.parent_kinematics_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU(),
+            nn.Linear(embed_dim // 2, 5),
+        )
 
         # Jet-level tau-tagging head. The global (cls) token already pools the
         # whole jet, so a small MLP on top of it is all that is needed for the
@@ -147,6 +155,7 @@ class ParTauDETR(ParticleTransformer):
     def no_weight_decay(self):
         return {
             "cls_token",
+            "cls_token_kinematics",
             "query_embed.weight",
         }
 
@@ -264,7 +273,15 @@ class ParTauDETR(ParticleTransformer):
 
             hs = hs.transpose(0, 1).contiguous()  # (N, Q, C)
 
+            parent_token = self.cls_token_kinematics.expand(1, batch_size, -1)
+            for block in self.cls_blocks:
+                parent_token = block(
+                    particle_memory, x_cls=parent_token, padding_mask=padding_mask
+                )
+            parent_features = self.norm(parent_token.squeeze(0))
+
             output = {
+                "pred_parent_kinematics": self.parent_kinematics_head(parent_features),
                 "pred_logits": self.objectness_head(hs),
                 "pred_kinematics": self.kinematics_head(hs),
                 "pred_charge_logits": self.charge_head(hs),

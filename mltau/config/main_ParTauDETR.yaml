@@ -79,6 +79,8 @@ model:
         metric: theta-phi # theta-phi for e+e-, eta-phi for pp
 
     detr:
+        pcgrad: true
+        regression_query_selection: matched
         decoder_num_layers: 4
         decoder_num_heads: null # null -> reuse encoder.num_heads
         decoder_ffn_ratio: 4
@@ -131,7 +133,9 @@ model:
             weight_meson_class: 1.0
             weight_consistency: 1.0
             weight_charge_count: 0.0
-            weight_parent_kinematics: 0.0
+            weight_parent_p4: 1.0
+            weight_mass_feasibility_daughters: 1.0
+            weight_mass_feasibility_parent: 0.0
             weight_parent_charge: 0.0
             weight_parent_decay_mode: 0.0
             # Differentiable alternatives to the matched-query parent losses.
@@ -139,7 +143,6 @@ model:
             # sharpened around the calibrated inference threshold t as
             # sigmoid((logit(p) - logit(t)) / temperature). Keep the temperature
             # between 0 and 1.
-            weight_soft_parent_kinematics: 0.0
             weight_soft_parent_charge: 1.0
             weight_soft_parent_decay_mode: 1.0
             parent_objectness_temperature: 0.1
@@ -161,6 +164,9 @@ model:
             # outright), and it removes a magic number. Re-derive if Q changes.
             eos_coef: 1.0
         inference:
+            conservation_iterations: 48
+            conservation_atol: 1.0e-8
+            conservation_rtol: 1.0e-7
             # Starting value and fallback for the objectness threshold. During
             # training it is recalibrated before every validation (see
             # training.threshold_scan), stored in the checkpoint, and that
@@ -171,6 +177,16 @@ model:
             # are kept in predict_step. Objectness is trained on signal jets
             # only, so whether a jet has daughters at all is the tagger's call.
             tau_id_threshold: 0.5
+
+    parent_tau_loss:
+        l_m: 0.2
+        label_smoothing: 0.0
+        kinematics_scales: null
+        kinematics_weights:
+            log_pt: 1.0
+            delta_eta: 1.0
+            phi_chord: 1.0
+            log_mass: 0.2
 
     tau_loss:
         l_m: 0.2 # mass-term weight in the kinematics loss

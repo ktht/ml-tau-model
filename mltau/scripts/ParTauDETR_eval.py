@@ -113,32 +113,10 @@ def calculate_metrics(matches, target_meson_class, pred_meson_class):
 
 
 def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
-    """Actual separation happens closer to obj_cls_trsh=[0.8-0.9] for well-trained models"""
-    object_probs = torch.softmax(outputs["pred_logits"], dim=-1)
-    pred_scores = object_probs[..., 0]
-    pred_mask = pred_scores >= obj_cls_trsh
+    """Use the shared parent-conserving prediction path."""
+    from mltau.tools.evaluation.decode_ParTauDETR import get_predicted_particles as decode_particles
 
-    pred_charge_probs = torch.softmax(outputs["pred_charge_logits"], dim=-1)
-
-    pred_charge_cls = pred_charge_probs.argmax(dim=-1)
-    charge_lut = outputs["pred_charge_logits"].new_tensor([-1, 0, 1], dtype=torch.long)
-    pred_charge = charge_lut[pred_charge_cls]
-
-    pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
-
-    pred_p4_tensor = decode_kinematics(
-        outputs["pred_kinematics"],
-        reco_jet_p4s["pt"],
-        reco_jet_p4s["eta"],
-        reco_jet_p4s["phi"],
-        reco_jet_p4s["energy"],
-    )
-    pred_p4 = p4_from_components(pred_p4_tensor)
-
-    pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
-    pred_charge = ak.drop_none(ak.mask(pred_charge, pred_mask))
-    pred_meson_class = ak.drop_none(ak.mask(pred_meson_class, pred_mask))
-    return pred_p4, pred_charge, pred_meson_class
+    return decode_particles(outputs, reco_jet_p4s, obj_cls_trsh=obj_cls_trsh)
 
 
 def get_true_particles(targets, reco_jet_p4s):
