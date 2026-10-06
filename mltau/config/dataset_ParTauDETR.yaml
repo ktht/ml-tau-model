@@ -25,7 +25,7 @@ dataset:
      # generator-level tau that's stored in the dataset. The correct solution
      # would be to rederive the target charge, DM and 4-momentum of the visible
      # generator-level tau after the pT cut. Note that this is only an issue if
-     # the pT cut is enabled and weight_parent_* weights are positive.
+    # the pT cut is enabled with exact daughter-parent momentum closure.
     tau_daughter_pt_cut: -1.0
     data_dir: /scratch/persistent/karl/ml-tau/1002_ParTauDETR_dataset/
 

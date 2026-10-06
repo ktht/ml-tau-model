@@ -32,6 +32,60 @@ Four task-specific CLS tokens independently attend to the shared backbone output
   - Kinematics: Combined loss using `HuberLoss(δ=1.0)` for $p_T$, $\eta$, and $m$, plus a chord loss (L2 distance) for the $(\sin\phi, \cos\phi)$ vector. The mass component is weighted by $\lambda_m = 0.2$.
 - **Conditional gating**: Auxiliary losses (charge, decay mode, kinematics) are multiplied by the truth tau label, so only signal jets contribute to those tasks.
 
+### Constrained ParTauDETR (Decoder Version 2)
+
+ParTauDETR predicts tau ID and visible-parent kinematics using separate CLS
+tokens with shared pooling blocks. Each daughter query predicts four allocation
+logits instead of independent kinematics. For tetrahedral unit vectors
+`(1,1,1), (1,-1,-1), (-1,1,-1), (-1,-1,1)` divided by `sqrt(3)`, the components
+are `t_i = (E + n_i . p) / 4`; the inverse is `E = sum(t)` and
+`p = 3 sum(t_i n_i)`. Four-vector storage remains `[px, py, pz, E]`.
+
+At inference, each component is softmax-normalized across queries passing the
+calibrated objectness threshold. Multiplication by detached parent components guarantees
+closure for every nonempty selection. Empty selections return no daughters;
+the direct parent prediction is still available. No momentum is repaired after
+decoding. For training and validation losses with N true daughters and M queries,
+the matcher enumerates every size-N subset, normalizes its fractions independently,
+and solves its N-by-N Hungarian assignment. The subset with the lowest summed
+matching cost wins. Decoding and costs are batched by target multiplicity in
+bounded chunks. Empty targets produce no matches; N greater than M is rejected.
+The winning subset is decoded again with gradients for all matched daughters,
+independently of objectness threshold. Its queries receive positive objectness
+labels and the others negative labels. Identity uses the same winning assignment.
+
+Both kinematic losses use scaled Huber residuals in log-pt ratio, delta-eta,
+wrapped `atan2(sin(delta_phi), cos(delta_phi))`, and log-mass ratio. Mass-squared
+is floored at `1e-12` only when forming log-mass. The physicality term penalizes
+`relu(-m_squared)` on winning-subset signal daughters, divided by
+`physicality_mass_squared_scale` in squared momentum units. Parent scales default
+to unity; daughter scales retain the previous measured values (the former
+small-angle phi scale initializes the wrapped-angle scale).
+
+Manual optimization applies asymmetric PCGrad only to tau ID versus parent
+kinematics, over parameters reached by both losses. Parent gradients remain
+unchanged; daughter gradients are added normally. The optimizer hook handles
+unscaled-gradient checks and clipping. Tau ID alone uses background jets and
+classification weights; all reconstruction losses are signal-only and unweighted.
+Old matched/soft aggregate parent and charge-count constraints are removed.
+
+Training and validation log `tau_kinematics`, `daughter_kinematics`,
+`daughter_physicality`, their components and weighted contributions, retained
+classification losses, closure, empty selections, spacelike fractions, and
+parent/daughter-sum response moments. Matched closure and matched spacelike
+fractions are logged separately from threshold-selected inference diagnostics.
+PCGrad conflict and projection statistics
+are logged during training. Threshold scans re-decode directions per threshold.
+Jet-level momentum sums use full daughter energies, not a massless approximation.
+
+Version-1 checkpoints cannot resume this architecture. New checkpoints persist
+the decoder version, calibrated threshold, optimizer/scheduler state when saved
+as full checkpoints, and best validation metrics. The new objective's optional
+divergence threshold is `model.detr.loss.val_loss_divergence_threshold`, disabled
+by default. Run the focused synthetic checks with
+`python -m unittest discover -s tests -p test_partau_detr.py` in the existing
+training environment. These checks require no parquet sample.
+
 ## Input Features
 
 17 features per candidate particle:

@@ -52,6 +52,7 @@ logging:
         workspace: null
 
 model:
+    momentum_decoder_version: 2
     # Always equal to dataset.max_tau_daughters, by interpolation. The matcher
     # hands out min(num_queries, n_targets) pairs, so with fewer queries than
     # target slots the surplus targets are unreachable and never supervised,
@@ -91,25 +92,7 @@ model:
             cost_kinematics_l1: 2.0
             cost_charge: 1.0
             cost_meson_class_ce: 1.0
-            # Per-component weights of the kinematics matching cost, over
-            # [log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio].
-            # These decide WHICH daughter a query is trained towards, so what
-            # matters is not that every component counts equally but that the
-            # assignment stays stable while the model is still wrong. Tau
-            # daughters are collimated (measured on z_train: sigma =
-            # [0.875, 0.077, 0.071, 0.028, 1.064]), so while the angular error is
-            # of order sigma, position cannot tell two daughters apart and pt
-            # and identity -- learned first -- have to carry the decision.
-            # Angles at 1/sigma (20) drowned them out: on synthetic daughters
-            # with 1-sigma noise the intended assignment was recovered 71% of
-            # the time and 46% of assignments changed between two noise draws,
-            # against 93% / 11% for the first model's unweighted cost. With 5
-            # and the clipped class cost below: 94% / 10% early, 99.4% / 0.9%
-            # late. sin_dphi and cos_dphi MUST share a weight (together they
-            # encode the angle). log_mass_ratio stays low: only ~5% of its
-            # variance is the daughter's own, the rest is the jet mass shared by
-            # every query in the jet, so it says little about WHICH daughter.
-            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0, 0.2]
+            kinematics_component_weights: [1.0, 5.0, 5.0, 0.2]
             # How the charge and PDG terms enter the MATCHING cost (not the
             # loss). "clipped_nll" is -log p(true class) clamped at
             # classification_cost_clip: sharp enough that identity decides a tie
@@ -124,25 +107,31 @@ model:
             classification_cost: clipped_nll
             classification_cost_clip: 5.0
         loss:
+            val_loss_divergence_threshold: null
             weight_objectness: 1.0
             weight_tau_id: 1.0
-            weight_kinematics: 5.0
+            weight_tau_kinematics: 2.0
+            weight_daughter_kinematics: 5.0
+            weight_daughter_physicality: 1.0
             weight_charge: 1.0
             weight_meson_class: 1.0
             weight_consistency: 1.0
-            weight_charge_count: 0.0
-            weight_parent_kinematics: 0.0
-            weight_parent_charge: 0.0
-            weight_parent_decay_mode: 0.0
-            # Differentiable alternatives to the matched-query parent losses.
-            # All queries contribute after their objectness probability p is
-            # sharpened around the calibrated inference threshold t as
-            # sigmoid((logit(p) - logit(t)) / temperature). Keep the temperature
-            # between 0 and 1.
-            weight_soft_parent_kinematics: 0.0
-            weight_soft_parent_charge: 1.0
-            weight_soft_parent_decay_mode: 1.0
-            parent_objectness_temperature: 0.1
+            physicality_mass_squared_scale: 1.0
+            parent_kinematics_scales:
+                log_pt: 1.0
+                delta_eta: 1.0
+                delta_phi: 1.0
+                log_mass: 1.0
+            daughter_kinematics_scales:
+                log_pt: 0.877
+                delta_eta: 0.072
+                delta_phi: 0.070
+                log_mass: 1.046
+            kinematics_weights:
+                log_pt: 1.0
+                delta_eta: 1.0
+                delta_phi: 1.0
+                log_mass: 0.2
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
             # queries the two sides carry equal total weight at
@@ -173,41 +162,11 @@ model:
             tau_id_threshold: 0.5
 
     tau_loss:
-        l_m: 0.2 # mass-term weight in the kinematics loss
         # Smoothing floors the tagging loss at ~0.199 (minimised at p=0.95) and
         # actively penalises confident predictions, while the other heads are
         # unsmoothed and can reach 0. That inflates tau_id's share of the total
         # and works against a figure of merit like misID at fixed efficiency.
         label_smoothing: 0.0
-        # Residual scales for the kinematics regression loss, one per
-        # component, in that component's own units. Each residual is divided by
-        # its scale before the Huber, so every component enters the loss as
-        # "error in units of the spread of its own target" and the weights below
-        # can all be 1.
-        #
-        # Measured on the daughter targets of z_train (47k daughters):
-        #   log_pt_ratio  sigma 0.877
-        #   delta_eta     sigma 0.072
-        #   sin_dphi      sigma 0.070   (the chord is ~|dphi| for collimated daughters)
-        #   log_mass_ratio sigma 1.046
-        # Recompute these if the target parameterisation or the sample changes;
-        # they are properties of the data, not tuning knobs. To reproduce the numbers:
-        # ./run.sh python mltau/scripts/measure_kinematics_scales.py --model DETR
-        kinematics_scales:
-            log_pt: 0.877
-            delta_eta: 0.072
-            phi_chord: 0.070
-            log_mass: 1.046
-        # With the residuals scaled, equal weights give each component an equal
-        # share. log_mass is the one worth reconsidering rather than reweighting:
-        # only 4.8% of the variance of log(m_dau/m_jet) comes from the daughter's
-        # identity, the other 95% is the jet mass, which every query in the jet
-        # would be re-deriving. See the note in the loss docstring.
-        kinematics_weights:
-            log_pt: 1.0
-            delta_eta: 1.0
-            phi_chord: 1.0
-            log_mass: 1.0
 
 defaults:
     - _self_

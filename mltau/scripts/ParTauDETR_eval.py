@@ -10,7 +10,7 @@ from mltau.tools.evaluation.decode_ParTauDETR import (
     sum_p4_components,
 )
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
-from mltau.tools.partau_detr import decode_kinematics
+from mltau.tools.partau_detr import predicted_momenta
 
 # from hydra import compose, initialize
 # from omegaconf import OmegaConf
@@ -126,13 +126,7 @@ def get_predicted_particles(outputs, reco_jet_p4s, obj_cls_trsh: float = 0.5):
 
     pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
 
-    pred_p4_tensor = decode_kinematics(
-        outputs["pred_kinematics"],
-        reco_jet_p4s["pt"],
-        reco_jet_p4s["eta"],
-        reco_jet_p4s["phi"],
-        reco_jet_p4s["energy"],
-    )
+    pred_p4_tensor, _, _ = predicted_momenta(outputs, reco_jet_p4s, obj_cls_trsh)
     pred_p4 = p4_from_components(pred_p4_tensor)
 
     pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
@@ -152,13 +146,7 @@ def get_true_particles(targets, reco_jet_p4s):
     target_meson_class = targets["particles_meson_class_ohe"].argmax(dim=-1)
     target_meson_class = ak.drop_none(ak.mask(target_meson_class, target_mask))
 
-    true_p4_tensor = decode_kinematics(
-        targets["particles_kinematics"],
-        reco_jet_p4s["pt"],
-        reco_jet_p4s["eta"],
-        reco_jet_p4s["phi"],
-        reco_jet_p4s["energy"],
-    )
+    true_p4_tensor = targets["particles_p4"]
     true_p4 = p4_from_components(true_p4_tensor)
     true_p4 = ak.drop_none(ak.mask(true_p4, target_mask))
     return true_p4, target_charge, target_meson_class

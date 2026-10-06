@@ -433,6 +433,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
         targets = {
             "particles_mask": torch.from_numpy(daughter_mask_np).bool(),
+            "particles_p4": torch.from_numpy(daughter_p4_np).float(),
             "particles_kinematics": torch.from_numpy(daughter_kinematics_np).float(),
             "particles_charge_ohe": torch.from_numpy(charge_ohe).float(),
             "particles_meson_class_ohe": torch.from_numpy(meson_class_ohe).float(),

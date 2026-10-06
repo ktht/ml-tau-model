@@ -11,7 +11,7 @@ from scipy.optimize import linear_sum_assignment
 from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
-from mltau.tools.partau_detr import decode_kinematics as decode_kinematics_p4
+from mltau.tools.partau_detr import predicted_momenta
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -101,13 +101,9 @@ def _assign(
     return pred_idx[valid].astype(np.int64), true_idx[valid].astype(np.int64)
 
 
-def _predicted_components(outputs, reco_jet_p4s):
+def _predicted_components(outputs, reco_jet_p4s, threshold=None):
     """
-    Dense [N, Q] predictions, before any objectness threshold is applied.
-
-    Split out because none of it depends on the threshold: a scan would
-    otherwise redo the softmaxes, the argmaxes and the kinematics decode once
-    per point.
+    Dense [N, Q] predictions normalized over queries passing the threshold.
     """
     object_probs = torch.softmax(outputs["pred_logits"], dim=-1)
     pred_scores = object_probs[..., 0]
@@ -119,13 +115,7 @@ def _predicted_components(outputs, reco_jet_p4s):
 
     pred_meson_class = outputs["pred_meson_class_logits"].argmax(dim=-1)
 
-    pred_p4_tensor = decode_kinematics_p4(
-        outputs["pred_kinematics"],
-        reco_jet_p4s["pt"],
-        reco_jet_p4s["eta"],
-        reco_jet_p4s["phi"],
-        reco_jet_p4s["energy"],
-    )
+    pred_p4_tensor, _, _ = predicted_momenta(outputs, reco_jet_p4s, threshold)
     pred_p4 = p4_from_components(pred_p4_tensor)
     return pred_scores, pred_p4, pred_charge, pred_meson_class
 
@@ -156,7 +146,7 @@ def get_predicted_particles(
     restricted to true tau jets, where the tagger has nothing to add.
     """
     pred_scores, pred_p4, pred_charge, pred_meson_class = _predicted_components(
-        outputs, reco_jet_p4s
+        outputs, reco_jet_p4s, obj_cls_trsh
     )
     pred_mask = pred_scores >= obj_cls_trsh
     if tau_scores is not None and tau_threshold is not None:
@@ -180,13 +170,7 @@ def get_true_particles(targets, reco_jet_p4s):
     target_meson_class = targets["particles_meson_class_ohe"].argmax(dim=-1)
     target_meson_class = ak.drop_none(ak.mask(target_meson_class, target_mask))
 
-    true_p4_tensor = decode_kinematics_p4(
-        targets["particles_kinematics"],
-        reco_jet_p4s["pt"],
-        reco_jet_p4s["eta"],
-        reco_jet_p4s["phi"],
-        reco_jet_p4s["energy"],
-    )
+    true_p4_tensor = targets["particles_p4"]
     true_p4 = p4_from_components(true_p4_tensor)
     true_p4 = ak.drop_none(ak.mask(true_p4, target_mask))
     return true_p4, target_charge, target_meson_class
@@ -462,16 +446,8 @@ def scan_thresholds(
     """
     Objectness threshold maximising the mean per-jet daughter F1.
 
-    Everything that does not depend on the threshold is computed once, outside
-    the loop: the softmaxes, the argmaxes and the kinematics decode (dense
-    [N, Q], since no mask has been applied yet), and the truth side flattened
-    to numpy. A point in the scan is then only a per-event boolean selection
-    plus the assignment itself.
-
-    Doing it the other way -- calling get_predicted_particles and
-    match_particles per point, each walking jagged awkward arrays element by
-    element -- costs about 4 minutes per point at 100k jets, so a 21-point scan
-    ran for an hour and a half without tqdm ever advancing past 0/21.
+    Daughter momenta are decoded again at every threshold because changing
+    the selected set changes the component-wise fraction normalization.
 
     `cfg` is accepted for call-site compatibility and not used.
     """
@@ -509,6 +485,9 @@ def scan_thresholds(
     n_events = scores.shape[0]
     f1_scores = []
     for obj_cls_trsh in tqdm.tqdm(thresholds, desc="threshold scan", unit="point"):
+        _, pred_p4, _, _ = _predicted_components(outputs, reco_jet_p4s, float(obj_cls_trsh))
+        p_eta = ak.to_numpy(pred_p4.eta)
+        p_phi = ak.to_numpy(pred_p4.phi)
         keep = scores >= obj_cls_trsh  # [N, Q]
         n_pred = keep.sum(axis=1)
         n_matched = np.zeros(n_events, dtype=np.int64)

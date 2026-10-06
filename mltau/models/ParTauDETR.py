@@ -3,7 +3,7 @@ import contextlib
 import torch
 from torch import nn
 
-from mltau.models.ParticleTransformer import ParticleTransformer
+from mltau.models.ParticleTransformer import ParticleTransformer, trunc_normal_
 
 
 class ParTauDETR(ParticleTransformer):
@@ -17,12 +17,13 @@ class ParTauDETR(ParticleTransformer):
 
     Decoder heads per query:
       - pred_logits: object vs no-object
-      - pred_kinematics: regression (5D kinematics target)
+    - pred_fraction_logits: four tetrahedral allocation logits
       - pred_charge_logits: charge classification logits
       - pred_meson_class_logits: configured meson classification logits
 
     Jet-level head:
       - is_tau: binary tau-tagging logits from the pooled global token.
+            - tau_kinematics: visible-parent regression from a dedicated token.
     """
 
     def __init__(
@@ -121,13 +122,20 @@ class ParTauDETR(ParticleTransformer):
 
         # DETR-style heads
         self.objectness_head = nn.Linear(embed_dim, 2)  # [object, no-object]
-        self.kinematics_head = nn.Sequential(
+        self.fraction_head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.GELU() if activation == "gelu" else nn.ReLU(),
-            nn.Linear(embed_dim, num_kinematics_components),
+            nn.Linear(embed_dim, 4),
         )
         self.charge_head = nn.Linear(embed_dim, num_charge_classes)
         self.meson_class_head = nn.Linear(embed_dim, num_meson_classes)
+        self.cls_token_kinematics = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        trunc_normal_(self.cls_token_kinematics, std=0.02)
+        self.parent_head = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.GELU() if activation == "gelu" else nn.ReLU(),
+            nn.Linear(embed_dim // 2, num_kinematics_components),
+        )
 
         # Jet-level tau-tagging head. The global (cls) token already pools the
         # whole jet, so a small MLP on top of it is all that is needed for the
@@ -147,6 +155,7 @@ class ParTauDETR(ParticleTransformer):
     def no_weight_decay(self):
         return {
             "cls_token",
+            "cls_token_kinematics",
             "query_embed.weight",
         }
 
@@ -264,9 +273,15 @@ class ParTauDETR(ParticleTransformer):
 
             hs = hs.transpose(0, 1).contiguous()  # (N, Q, C)
 
+            parent_token = self.cls_token_kinematics.expand(1, batch_size, -1)
+            for block in self.cls_blocks:
+                parent_token = block(
+                    particle_memory, x_cls=parent_token, padding_mask=padding_mask
+                )
             output = {
                 "pred_logits": self.objectness_head(hs),
-                "pred_kinematics": self.kinematics_head(hs),
+                "pred_fraction_logits": self.fraction_head(hs),
+                "tau_kinematics": self.parent_head(self.norm(parent_token.squeeze(0))),
                 "pred_charge_logits": self.charge_head(hs),
                 "pred_meson_class_logits": self.meson_class_head(hs),
             }

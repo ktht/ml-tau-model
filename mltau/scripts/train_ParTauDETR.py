@@ -654,7 +654,7 @@ def train(cfg: DictConfig):
             patience=10**9,
             check_finite=True,
             divergence_threshold=_optional_float(
-                cfg.training.trainer.get("val_loss_divergence_threshold", 3.0)
+                cfg.model.detr.loss.get("val_loss_divergence_threshold", None)
             ),
             verbose=True,
         ),
@@ -681,8 +681,7 @@ def train(cfg: DictConfig):
         accelerator=check_accelerator(cfg),
         devices=cfg.training.trainer.devices,
         precision=str(cfg.training.trainer.precision),
-        gradient_clip_val=float(cfg.training.trainer.get("gradient_clip_val", 1.0)),
-        gradient_clip_algorithm="norm",
+        gradient_clip_val=None,
         num_sanity_val_steps=cfg.training.trainer.num_sanity_val_steps,
         enable_progress_bar=True,
         **_optional_trainer_kwargs(cfg),

@@ -48,6 +48,7 @@ from ntupelizer.tools import tau_decaymode as tdm
 from mltau.tools.logging import kinematics as kinematics_logging
 from mltau.tools.logging import tagging as tagging_logging
 from mltau.tools.logging.general import log_metrics_dict
+from mltau.tools.partau_detr import decode_kinematics, decode_fractions, momentum_coordinates
 
 # Decay mode is NOT derived here. It goes through ntupelizer.tools.tau_decaymode
 # (ml-tau-data), which classifies each daughter by particle PROPERTY -- charged
@@ -181,7 +182,7 @@ def decay_modes(pdg: np.ndarray, valid: np.ndarray) -> dict:
     }
 
 
-def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
+def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, p4=None):
     """
     Collapse a set of daughters into per-jet quantities.
 
@@ -201,20 +202,9 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     eta_jet = reco_jet["eta"]
     phi_jet = reco_jet["phi"]
 
-    pt = torch.exp(kin[..., 0]) * pt_jet[:, None]
-    eta = kin[..., 1] + eta_jet[:, None]
-    phi = phi_jet[:, None] + torch.atan2(kin[..., 2], kin[..., 3])
-
-    mask = valid.to(pt.dtype)
-    px = (pt * torch.cos(phi) * mask).sum(-1)
-    py = (pt * torch.sin(phi) * mask).sum(-1)
-    pz = (pt * torch.sinh(eta) * mask).sum(-1)
-    # Daughters are treated as massless in the sum: at these momenta a pion's
-    # mass is ~0.01% of its energy, and using the predicted log-mass instead
-    # would make the tau energy depend on the least determined component of the
-    # target. The tau mass is then still non-zero, as it comes from the opening
-    # angles between the daughters.
-    energy = (pt * torch.cosh(eta) * mask).sum(-1)
+    if p4 is None:
+        p4 = decode_kinematics(kin, pt_jet, eta_jet, phi_jet, reco_jet["energy"])
+    px, py, pz, energy = (p4 * valid[..., None]).sum(1).unbind(-1)
 
     pt_tau = torch.sqrt(px**2 + py**2 + eps)
     eta_tau = torch.asinh(pz / pt_tau)
@@ -528,6 +518,7 @@ def _mean_f1(scores, threshold, pred_eta, pred_phi, true_eta, true_phi, true_val
 def scan_threshold(
     scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged,
     thresholds=None, max_dr: float = 0.4, objective: str = "decay_mode",
+    fraction_logits=None, parent_p4=None,
 ):
     """
     Objectness threshold maximising `objective` over true tau jets.
@@ -564,6 +555,17 @@ def scan_threshold(
     true_eta, true_phi, true_valid, true_charged = (
         true_eta[signal], true_phi[signal], true_valid[signal], true_charged[signal]
     )
+    if fraction_logits is not None:
+        fraction_logits = torch.as_tensor(fraction_logits[signal])
+        parent_p4 = torch.as_tensor(parent_p4[signal])
+
+    def directions(threshold):
+        if fraction_logits is None:
+            return pred_eta, pred_phi
+        decoded = decode_fractions(fraction_logits, parent_p4, torch.as_tensor(scores >= threshold))
+        coordinates = momentum_coordinates(decoded)
+        return coordinates[..., 1].numpy(), coordinates[..., 2].numpy()
+
     n_charged_true = (true_valid & true_charged).sum(axis=1)
     n_neutral_true = (true_valid & ~true_charged).sum(axis=1)
 
@@ -578,14 +580,16 @@ def scan_threshold(
             ),
         }
         if objective == "f1":
-            entry["f1"] = _mean_f1(scores, threshold, pred_eta, pred_phi, true_eta, true_phi, true_valid, max_dr)
+            current_eta, current_phi = directions(threshold)
+            entry["f1"] = _mean_f1(scores, threshold, current_eta, current_phi, true_eta, true_phi, true_valid, max_dr)
         by_threshold[float(threshold)] = entry
 
     key = "decay_mode_accuracy" if objective == "decay_mode" else "f1"
     best = max(by_threshold, key=lambda t: by_threshold[t][key])
     if "f1" not in by_threshold[best]:
+        current_eta, current_phi = directions(best)
         by_threshold[best]["f1"] = _mean_f1(
-            scores, best, pred_eta, pred_phi, true_eta, true_phi, true_valid, max_dr
+            scores, best, current_eta, current_phi, true_eta, true_phi, true_valid, max_dr
         )
     return best, by_threshold
 
@@ -606,7 +610,8 @@ class ThresholdCalibrationBuffer:
     def reset(self) -> None:
         self.batches.clear()
 
-    def add(self, scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged) -> None:
+    def add(self, scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged,
+            fraction_logits=None, parent_p4=None) -> None:
         self.batches.append({
             "scores": scores.detach().float().cpu().numpy(),
             "pred_eta": pred_eta.detach().float().cpu().numpy(),
@@ -617,6 +622,9 @@ class ThresholdCalibrationBuffer:
             "true_valid": true_valid.detach().bool().cpu().numpy(),
             "true_charged": true_charged.detach().bool().cpu().numpy(),
         })
+        if fraction_logits is not None:
+            self.batches[-1]["fraction_logits"] = fraction_logits.detach().float().cpu().numpy()
+            self.batches[-1]["parent_p4"] = parent_p4.detach().float().cpu().numpy()
         while sum(len(b["scores"]) for b in self.batches) > self.max_jets and len(self.batches) > 1:
             self.batches.pop(0)
 
@@ -631,4 +639,5 @@ class ThresholdCalibrationBuffer:
             merged["scores"], merged["pred_eta"], merged["pred_phi"], merged["pred_charged"],
             merged["true_eta"], merged["true_phi"], merged["true_valid"], merged["true_charged"],
             thresholds=thresholds, max_dr=max_dr, objective=objective,
+            fraction_logits=merged.get("fraction_logits"), parent_p4=merged.get("parent_p4"),
         )
