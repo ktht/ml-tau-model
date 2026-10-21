@@ -132,8 +132,8 @@ class TauLoss(nn.Module):
             tau_loss:
                 l_m: 0.2                 # legacy mass weight, used if no weights
                 label_smoothing: 0.1
-                kinematics_scales:  {log_pt: .., delta_eta: .., phi_chord: .., log_mass: ..}
-                kinematics_weights: {log_pt: 1, delta_eta: 1, phi_chord: 1, log_mass: 0.2}
+                kinematics_scales:  model-specific component scales
+                kinematics_weights: model-specific component weights
 
         ParTauDETR, MultiParTau and SingleParTau all construct their loss here,
         so the three are configured the same way. The scales are properties of
@@ -149,9 +149,9 @@ class TauLoss(nn.Module):
         if not scales:
             warnings.warn(
                 f"[{owner}] tau_loss.kinematics_scales is not set. The kinematics "
-                "loss runs in its legacy unscaled form (Huber in raw units, linear "
-                "phi chord), in which the angular components carry almost no "
-                "gradient. Measure the scales with "
+                "loss runs in its unscaled form (Huber in raw units), in which "
+                "small angular residuals can carry very little gradient. "
+                "Measure the scales with "
                 "`python3 mltau/scripts/measure_kinematics_scales.py` and put "
                 "them in the config.",
                 stacklevel=2,
@@ -190,26 +190,48 @@ class TauLoss(nn.Module):
         return weighted_mean(loss, weights)
 
     def _compute_kinematics_loss_per_sample(self, predictions, targets):
-        """
-        Per-sample Huber loss for (log pt, deta, phi_chord, log m).
+        """Huber regression for DETR's four channels or ParT's legacy five."""
+        if predictions.size(-1) == 4:
+            scales = self.kinematics_scales or {}
+            scale = lambda name: scales.get(name, 1.0)
+            weights = self.kinematics_weights
+            component_weights = {
+                "log_pt": weights.get("log_pt", 1.0),
+                "delta_theta": weights.get("delta_theta", 1.0),
+                "delta_phi": weights.get("delta_phi", 1.0),
+                "log_mass": weights.get("log_mass", self.l_m),
+            }
+            log_pt_loss = self.kin_loss_fn(
+                predictions[:, 0] / scale("log_pt"),
+                targets[:, 0] / scale("log_pt"),
+            )
+            delta_theta_loss = self.kin_loss_fn(
+                predictions[:, 1] / scale("delta_theta"),
+                targets[:, 1] / scale("delta_theta"),
+            )
+            delta_phi_loss = self.kin_loss_fn(
+                predictions[:, 2] / scale("delta_phi"),
+                targets[:, 2] / scale("delta_phi"),
+            )
+            log_mass_loss = self.kin_loss_fn(
+                predictions[:, 3] / scale("log_mass"),
+                targets[:, 3] / scale("log_mass"),
+            )
+            weight_sum = sum(component_weights.values()) + 1e-12
+            per_sample_loss = (
+                component_weights["log_pt"] * log_pt_loss
+                + component_weights["delta_theta"] * delta_theta_loss
+                + component_weights["delta_phi"] * delta_phi_loss
+                + component_weights["log_mass"] * log_mass_loss
+            ) / weight_sum
+            return per_sample_loss, {
+                "log_pt": log_pt_loss,
+                "delta_theta": delta_theta_loss,
+                "delta_phi": delta_phi_loss,
+                "log_mass": log_mass_loss,
+            }
 
-        Every residual is divided by its component's scale first, so all four
-        enter the Huber in the same units: multiples of the spread of that
-        target. That is what makes the weights below comparable.
-
-        Scaling is not cosmetic. The components differ by more than an order of
-        magnitude in natural size -- log_pt has a spread of ~0.9 while delta_eta
-        has ~0.08 -- and Huber is quadratic below delta=1, so an unscaled
-        delta_eta residual contributes ~100x less loss and gradient than an
-        unscaled log_pt residual of the same relative size. Hand-tuned weights
-        cannot fix that, because the ratio between a quadratic and a linear term
-        keeps moving as the model improves; dividing by the scale fixes it once.
-
-        Dividing by the scale also puts the Huber knee at one scale unit, which
-        is where it belongs: quadratic for typical residuals, linear for the
-        tail, instead of quadratic everywhere (delta_eta) or linear everywhere
-        (a chord of order 1 at initialisation).
-        """
+        # Legacy five-channel parameterization used by ParT.
         scaled = self.kinematics_scales is not None
         s = self.kinematics_scales or {
             "log_pt": 1.0, "delta_eta": 1.0, "phi_chord": 1.0, "log_mass": 1.0
@@ -262,7 +284,7 @@ class TauLoss(nn.Module):
         }
 
     def compute_kinematics_loss(self, predictions, targets, weights):
-        """Huber loss for (log pt, deta, phi_chord, log m)."""
+        """Compute the weighted kinematics loss for matched predictions."""
         per_sample_loss, components_per_sample = self._compute_kinematics_loss_per_sample(
             predictions, targets
         )

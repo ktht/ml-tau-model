@@ -20,9 +20,9 @@ def decode_kinematics(
     """Decode ParTauDETR kinematics into Cartesian four-momenta.
 
     ``kinematics`` has final dimension
-    ``[log_pt_ratio, delta_eta, sin_dphi, cos_dphi, log_mass_ratio]``.
+    ``[log_pt_ratio, delta_theta, delta_phi, log_mass_ratio]``.
     Reference tensors may omit trailing object dimensions, such as a ``[B]``
-    jet reference used with ``[B, Q, 5]`` kinematics.
+    jet reference used with ``[B, Q, 4]`` kinematics.
 
     ``fixed_mass`` (same shape as the decoded pt) replaces the regressed
     log-mass-ratio channel entirely: a daughter's mass is set by its identity
@@ -51,17 +51,18 @@ def decode_kinematics(
         )
     )
     log_pt_ratio = kinematics[..., 0]
-    log_mass_ratio = kinematics[..., 4]
+    log_mass_ratio = kinematics[..., 3]
     if clamp_log_ratios:
         log_pt_ratio = log_pt_ratio.clamp(-5.0, 5.0)
         log_mass_ratio = log_mass_ratio.clamp(-5.0, 5.0)
 
     pt = torch.exp(log_pt_ratio) * reference_pt
-    eta = kinematics[..., 1] + reference_eta
-    if clamp_log_ratios:
-        max_abs_eta = math.acosh(math.sqrt(torch.finfo(kinematics.dtype).max))
-        eta = eta.clamp(-max_abs_eta, max_abs_eta)
-    phi = reference_phi + torch.atan2(kinematics[..., 2], kinematics[..., 3])
+    reference_theta = 2.0 * torch.atan(torch.exp(-reference_eta))
+    theta = reference_theta + kinematics[..., 1]
+    theta_eps = torch.finfo(kinematics.dtype).eps
+    theta = theta.clamp(theta_eps, math.pi - theta_eps)
+    eta = -torch.log(torch.tan(theta / 2.0))
+    phi = reference_phi + kinematics[..., 2]
     if fixed_mass is not None:
         mass = fixed_mass.to(dtype=kinematics.dtype, device=kinematics.device)
     else:
@@ -89,7 +90,7 @@ class ParTauDETR(ParticleTransformer):
 
     Decoder heads per query:
       - pred_logits: object vs no-object
-      - pred_kinematics: regression (5D kinematics target)
+      - pred_kinematics: regression (4D kinematics target)
       - pred_charge_logits: charge classification logits
       - pred_meson_class_logits: configured meson classification logits
 
@@ -103,7 +104,7 @@ class ParTauDETR(ParticleTransformer):
         num_meson_classes: int,
         num_queries: int = 8,
         num_charge_classes: int = 3,
-        num_kinematics_components: int = 5,
+        num_kinematics_components: int = 4,
         # decoder configuration
         decoder_num_layers: int = 4,
         decoder_num_heads: int | None = None,
@@ -216,6 +217,14 @@ class ParTauDETR(ParticleTransformer):
             )
         else:
             self.tau_head = None
+
+    @staticmethod
+    def _bound_kinematics_angles(kinematics: torch.Tensor) -> torch.Tensor:
+        angle_limit = math.pi / 2.0
+        bounded_angles = angle_limit * torch.tanh(kinematics[..., 1:3])
+        return torch.cat(
+            (kinematics[..., :1], bounded_angles, kinematics[..., 3:]), dim=-1
+        )
 
     @torch.jit.ignore()
     def no_weight_decay(self):
@@ -360,7 +369,9 @@ class ParTauDETR(ParticleTransformer):
 
             output = {
                 "pred_logits": self.objectness_head(hs),
-                "pred_kinematics": self.kinematics_head(hs),
+                "pred_kinematics": self._bound_kinematics_angles(
+                    self.kinematics_head(hs)
+                ),
                 "pred_charge_logits": self.charge_head(hs),
                 "pred_meson_class_logits": self.meson_class_head(hs),
             }
@@ -372,7 +383,9 @@ class ParTauDETR(ParticleTransformer):
                     aux_outputs.append(
                         {
                             "pred_logits": self.objectness_head(layer_hs),
-                            "pred_kinematics": self.kinematics_head(layer_hs),
+                            "pred_kinematics": self._bound_kinematics_angles(
+                                self.kinematics_head(layer_hs)
+                            ),
                             "pred_charge_logits": self.charge_head(layer_hs),
                             "pred_meson_class_logits": self.meson_class_head(
                                 layer_hs

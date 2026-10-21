@@ -61,6 +61,13 @@ def check_structure(batch, n_features: int, max_cands: int):
     assert batch[0].shape[1:] == (n_features, max_cands), batch[0].shape
     assert batch[1].shape[1:] == (4, max_cands), batch[1].shape
     assert isinstance(batch[2], dict) and "is_tau" in batch[2]
+    if "particles_kinematics" in batch[2]:
+        daughter_kinematics = batch[2]["particles_kinematics"]
+        daughter_mask = batch[2]["particles_mask"].bool()
+        assert daughter_kinematics.shape[-1] == 4, daughter_kinematics.shape
+        if daughter_mask.any():
+            angular_targets = daughter_kinematics[daughter_mask][:, 1:3]
+            assert torch.all(angular_targets.abs() <= torch.pi / 2 + 1e-6)
     assert batch[3].shape[1:] == (1, max_cands), batch[3].shape
     assert batch[4].ndim == 1
     for p4 in batch[5:8]:

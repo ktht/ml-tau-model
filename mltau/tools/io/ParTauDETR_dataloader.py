@@ -29,8 +29,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
     Targets are replaced with daughter-level set targets:
       - particles_mask: [N, T] (True for valid daughter)
-      - particles_kinematics: [N, T, 5] =
-          [log(pt_dau/pt_jet), delta_eta(dau-jet), sin(delta_phi), cos(delta_phi), log(m_dau/m_jet)]
+      - particles_kinematics: [N, T, 4] =
+          [log(pt_dau/pt_jet), delta_theta(dau-jet), delta_phi(dau-jet), log(m_dau/m_jet)]
       - particles_charge_ohe: [N, T, 3] one-hot for charges [-1, 0, +1]
       - particles_meson_class_ohe: [N, T, C] one-hot over configured meson classes
 
@@ -407,10 +407,17 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             )
             jet_mass_2d = np.maximum(jet_mass[:, None], eps)
 
-            daughter_deta = dau_eta - jet_eta_2d
+            daughter_theta = 2.0 * np.arctan(np.exp(-dau_eta))
+            jet_theta_2d = 2.0 * np.arctan(np.exp(-jet_eta_2d))
+            daughter_dtheta = np.clip(
+                daughter_theta - jet_theta_2d, -np.pi / 2.0, np.pi / 2.0
+            )
             daughter_dphi_raw = dau_phi - jet_phi_2d
             daughter_dphi = np.arctan2(
                 np.sin(daughter_dphi_raw), np.cos(daughter_dphi_raw)
+            )
+            daughter_dphi = np.clip(
+                daughter_dphi, -np.pi / 2.0, np.pi / 2.0
             )
             daughter_log_pt_ratio = np.clip(
                 np.log(np.maximum(dau_pt / jet_pt_2d, eps)), -_LOG_CLAMP, _LOG_CLAMP
@@ -427,9 +434,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             daughter_kinematics_np = np.stack(
                 [
                     daughter_log_pt_ratio,
-                    daughter_deta,
-                    np.sin(daughter_dphi),
-                    np.cos(daughter_dphi),
+                    daughter_dtheta,
+                    daughter_dphi,
                     daughter_log_mass_ratio,
                 ],
                 axis=-1,
@@ -451,7 +457,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             n_slots = max(int(max_tau_daughters), 0)
             daughter_mask_np = np.zeros((n_jets, n_slots), dtype=bool)
             daughter_p4_np = np.zeros((n_jets, n_slots, 4), dtype=np.float32)
-            daughter_kinematics_np = np.zeros((n_jets, n_slots, 5), dtype=np.float32)
+            daughter_kinematics_np = np.zeros((n_jets, n_slots, 4), dtype=np.float32)
             daughter_charge = np.zeros((n_jets, n_slots), dtype=np.int64)
             daughter_pdg = np.zeros((n_jets, n_slots), dtype=np.int64)
 
