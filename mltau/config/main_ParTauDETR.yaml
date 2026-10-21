@@ -90,7 +90,7 @@ model:
         # intermediate decoder layer's queries go through the shared heads and
         # get the full matched set loss, weighted by loss.weight_aux. Training
         # mode only; inference always uses the final layer alone.
-        aux_loss: true
+        aux_loss: false
         matcher:
             cost_objectness: 1.0
             cost_kinematics_l1: 2.0
@@ -116,7 +116,7 @@ model:
             # every query in the jet, so it says little about WHICH daughter.
             # 0 with loss.mass_from_meson_class: the mass channel is then
             # untrained and must not steer the assignment either.
-            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0, 0.0]
+            kinematics_component_weights: [1.0, 5.0, 5.0, 5.0, 0.2]
             # How the charge and PDG terms enter the MATCHING cost (not the
             # loss). "clipped_nll" is -log p(true class) clamped at
             # classification_cost_clip: sharp enough that identity decides a tie
@@ -151,13 +151,13 @@ model:
             # (5.74 -> 5.00%) at unchanged decay mode / charge / F1. Needs
             # aux_loss alongside: alone, sub-threshold queries leak into the
             # soft sum in training and the hard-threshold tau lands ~4% low.
-            weight_soft_parent_kinematics: 2.0
-            weight_soft_parent_charge: 0.5
+            weight_soft_parent_kinematics: 0.0
+            weight_soft_parent_charge: 1.0
             weight_soft_parent_decay_mode: 1.0
             # Weight of the summed per-intermediate-layer set losses when
             # model.detr.aux_loss is true. DETR uses 1.0; here 1.0 (and 0.3 at
             # lr 3e-4 without the soft-parent terms) diverged near peak LR.
-            weight_aux: 0.3
+            weight_aux: 0.0
             # Decode daughter mass from the predicted meson class (pi+- or pi0
             # mass) instead of the regressed log-mass channel, wherever the
             # criterion turns kinematics into p4 (parent constraints). Paired
@@ -165,7 +165,7 @@ model:
             # matcher component weight: the mass channel then carries no loss,
             # and its (untrained) output never reaches a four-momentum. Decode
             # offline with decode_ParTauDETR's mass_from_class=True to match.
-            mass_from_meson_class: true
+            mass_from_meson_class: false
             parent_objectness_temperature: 0.1
             # Loss weight of the "no object" class of the objectness head; the
             # object class has weight 1. With n_obj real daughters among Q
@@ -232,18 +232,18 @@ model:
             delta_eta: 1.0
             phi_chord: 1.0
             # 0 with detr.loss.mass_from_meson_class (see there).
-            log_mass: 0.0
+            log_mass: 1.0
 
 # ParTauDETR-specific overrides of training.yaml (hence _self_ last below).
 training:
     # With the signed angular / impact-parameter inputs, peak LR 3e-4 diverged
     # in 4 runs once the combined losses above were on; 2e-4 was stable over
     # two seeds and a 120-epoch run.
-    lr: 0.0002
+    lr: 0.0003
     # Standardise the continuous candidate inputs (see training.yaml). The
     # signed impact-parameter significances reach |s| ~ 1e4 unscaled.
     input_scaling:
-        enabled: true
+        enabled: false
 
 # `_self_` last so the `training:` block above wins over training.yaml. No
 # other key here overlaps with the files below.

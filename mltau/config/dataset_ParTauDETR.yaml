@@ -15,8 +15,8 @@ dataset:
     #   dataset.impact_parameter_features.transform_scale=30
     impact_parameter_features:
         significance_transform: none # none | log | tanh | raw_error
-        tanh_scale: 5.0
-        use_log_significance: false
+        tanh_scale: 0.0
+        use_log_significance:  true
         transform_scale: 0.0
     # Target slots per jet, and (by interpolation) the number of decoder
     # queries. Measured over all 5.3M signal jets of the 0915 production with

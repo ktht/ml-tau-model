@@ -653,6 +653,9 @@ class SetCriterion(nn.Module):
             "selected_unmatched": extra.to(gate.dtype),
             "matched_below_threshold": missed.to(gate.dtype),
             "matched_selected": hard_intersection.to(gate.dtype),
+            "matched_only": matched_float,
+            "selected_only": hard_selected.to(gate.dtype),
+            "soft_only": gate,
         }
         for name, query_weights in selections.items():
             summed = (pred_p4 * query_weights.unsqueeze(-1)).sum(dim=1)
