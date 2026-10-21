@@ -2016,6 +2016,10 @@ class ParTauDETRModule(L.LightningModule):
             pdg=repr_pdg[outputs["pred_meson_class_logits"].argmax(-1)],
             valid=scores >= float(self.score_threshold_calibrated),
             reco_jet=reco_jet,
+            fixed_mass=(
+                self.criterion.meson_class_mass[outputs["pred_meson_class_logits"].argmax(-1)]
+                if self.criterion.mass_from_meson_class else None
+            ),
         )
         # Padded slots carry ignore_index; clamp before the lookup and let the
         # mask decide what counts.

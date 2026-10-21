@@ -179,7 +179,7 @@ def decay_modes(pdg: np.ndarray, valid: np.ndarray) -> dict:
     }
 
 
-def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
+def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, fixed_mass=None):
     """
     Collapse a set of daughters into per-jet quantities.
 
@@ -194,6 +194,7 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
         pdg:    [B, S] absolute PDG id
         valid:  [B, S] bool, which slots count
         reco_jet: dict of [B] tensors with pt, eta, phi, energy
+        fixed_mass: optional [B, S] daughter masses (for class-based decoding)
     """
     eps = 1e-6
     pt_jet = reco_jet["pt"]
@@ -221,23 +222,25 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet):
     px = (pt * torch.cos(phi) * mask).sum(-1)
     py = (pt * torch.sin(phi) * mask).sum(-1)
     pz = (pt * torch.sinh(eta) * mask).sum(-1)
-    # Daughters are treated as massless in the sum: at these momenta a pion's
-    # mass is ~0.01% of its energy, and using the predicted log-mass instead
-    # would make the tau energy depend on the least determined component of the
-    # target. The tau mass is then still non-zero, as it comes from the opening
-    # angles between the daughters.
-    energy = (pt * torch.cosh(eta) * mask).sum(-1)
-
-    pt_tau = torch.sqrt(px**2 + py**2 + eps)
-    eta_tau = torch.asinh(pz / pt_tau)
-    phi_tau = torch.atan2(py, px)
-    mass_tau = torch.sqrt(torch.clamp(energy**2 - (px**2 + py**2 + pz**2), min=0.0))
-
     mass_jet = torch.sqrt(
         torch.clamp(
             reco_jet["energy"] ** 2 - (pt_jet * torch.cosh(eta_jet)) ** 2, min=0.0
         )
     ).clamp_min(eps)
+    mass_index = 3 if kin.shape[-1] == 4 else 4
+    daughter_mass = (
+        fixed_mass
+        if fixed_mass is not None
+        else torch.exp(kin[..., mass_index]) * mass_jet[:, None]
+    )
+    energy = (
+        torch.sqrt((pt * torch.cosh(eta)) ** 2 + daughter_mass**2) * mask
+    ).sum(-1)
+
+    pt_tau = torch.sqrt(px**2 + py**2 + eps)
+    eta_tau = torch.asinh(pz / pt_tau)
+    phi_tau = torch.atan2(py, px)
+    mass_tau = torch.sqrt(torch.clamp(energy**2 - (px**2 + py**2 + pz**2), min=0.0))
 
     d_phi = phi_tau - phi_jet
     # Legacy five-component vector consumed by the shared metric logger.
