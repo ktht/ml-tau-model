@@ -651,6 +651,18 @@ class SetCriterion(nn.Module):
         true_pt = target_parent_p4["pt"].float().clamp_min(1e-8)
         true_momentum = true_pt * torch.cosh(target_parent_p4["eta"].float())
         true_energy = target_parent_p4["energy"].float().clamp_min(1e-8)
+        true_theta = 2.0 * torch.atan(torch.exp(-target_parent_p4["eta"].float()))
+        true_phi = target_parent_p4["phi"].float()
+
+        def resolution(
+            values: torch.Tensor, ratio: bool = False, valid: torch.Tensor = signal_mask
+        ) -> torch.Tensor:
+            selected = values[valid]
+            if selected.numel() == 0:
+                return values.new_zeros(())
+            spread = torch.quantile(selected, 0.75) - torch.quantile(selected, 0.25)
+            return spread / torch.quantile(selected, 0.5).clamp_min(1e-8) if ratio else spread
+
         selections = {
             "unmatched_gate_weighted": gate * (~matched),
             "selected_unmatched": extra.to(gate.dtype),
@@ -664,9 +676,29 @@ class SetCriterion(nn.Module):
             summed = (pred_p4 * query_weights.unsqueeze(-1)).sum(dim=1)
             momentum = torch.linalg.vector_norm(summed[:, :3], dim=1)
             pt = torch.linalg.vector_norm(summed[:, :2], dim=1)
-            diagnostics[f"momentum/{name}_p_over_parent"] = signal_mean(momentum / true_momentum.clamp_min(1e-8))
-            diagnostics[f"momentum/{name}_energy_over_parent"] = signal_mean(summed[:, 3] / true_energy)
-            diagnostics[f"momentum/{name}_pt_over_parent"] = signal_mean(pt / true_pt)
+            ratios = {
+                "p": momentum / true_momentum.clamp_min(1e-8),
+                "energy": summed[:, 3] / true_energy,
+                "pt": pt / true_pt,
+            }
+            for variable, values in ratios.items():
+                diagnostics[f"momentum/{name}_{variable}_over_parent"] = signal_mean(values)
+                diagnostics[f"momentum/{name}_{variable}_resolution"] = resolution(values, ratio=True)
+
+            valid_direction = signal_mask & (momentum > 1e-8)
+            pred_theta = torch.atan2(pt, summed[:, 2])
+            theta_diff = torch.rad2deg(pred_theta - true_theta)
+            pred_phi = torch.atan2(summed[:, 1], summed[:, 0])
+            phi_diff = torch.rad2deg(torch.atan2(
+                torch.sin(pred_phi - true_phi), torch.cos(pred_phi - true_phi)
+            ))
+            for variable, values in (("theta", theta_diff), ("phi", phi_diff)):
+                diagnostics[f"momentum/{name}_{variable}_diff"] = (
+                    values * valid_direction
+                ).sum() / valid_direction.sum().clamp_min(1)
+                diagnostics[f"momentum/{name}_{variable}_resolution"] = resolution(
+                    values, valid=valid_direction
+                )
         return diagnostics
 
     def _compute_parent_charge_loss(
