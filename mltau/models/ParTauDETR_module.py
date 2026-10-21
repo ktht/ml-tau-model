@@ -683,8 +683,12 @@ class SetCriterion(nn.Module):
             }
             for variable, values in ratios.items():
                 diagnostics[f"momentum/{name}_{variable}_over_parent"] = signal_mean(values)
+                if name not in ("matched_only", "selected_only", "soft_only"):
+                    continue
                 diagnostics[f"momentum/{name}_{variable}_resolution"] = resolution(values, ratio=True)
 
+            if name not in ("matched_only", "selected_only", "soft_only"):
+                continue
             valid_direction = signal_mask & (momentum > 1e-8)
             pred_theta = torch.atan2(pt, summed[:, 2])
             theta_diff = torch.rad2deg(pred_theta - true_theta)
@@ -2228,7 +2232,13 @@ class ParTauDETRModule(L.LightningModule):
         )
         for key, value in losses.items():
             if key.startswith(("matching/", "momentum/")):
-                self.log(f"val/{key}", value, on_step=False, on_epoch=True)
+                self.log(
+                    f"val/{key}", value,
+                    on_step=key.startswith("momentum/") and (
+                        key.endswith("_resolution") or key.endswith("_diff")
+                    ),
+                    on_epoch=True,
+                )
 
         if not self.trainer.sanity_checking:
             self._accumulate_jet_level(batch, outputs, targets)
