@@ -211,7 +211,7 @@ class HungarianMatcher(nn.Module):
         self.cost_objectness = cost_objectness
         self.cost_kinematics_l1 = cost_kinematics_l1
         # Per-component weights for the kinematics matching cost, over
-        # [log_pt_ratio, delta_theta, delta_phi, log_mass_ratio].
+        # [log_p_ratio, delta_theta, delta_phi, log_mass_ratio].
         #
         # Unweighted, the log ratios (sigma ~1) dominate and the angular offsets
         # of collimated daughters (sigma ~0.07) barely count. Weighting the
@@ -528,6 +528,7 @@ class SetCriterion(nn.Module):
         device = pred_parent_p4.device
         pred_px, pred_py, pred_pz, pred_energy = pred_parent_p4.unbind(dim=-1)
         pred_pt = torch.sqrt((pred_px**2 + pred_py**2).clamp_min(1e-12))
+        pred_p = torch.sqrt((pred_px**2 + pred_py**2 + pred_pz**2).clamp_min(1e-12))
         pred_eta = torch.asinh(pred_pz / pred_pt.clamp_min(1e-6))
         pred_phi = torch.atan2(pred_py, pred_px)
         pred_mass = torch.sqrt(
@@ -539,6 +540,7 @@ class SetCriterion(nn.Module):
 
         true_pt = target_parent_p4["pt"].to(dtype=pred_pt.dtype, device=device)
         true_eta = target_parent_p4["eta"].to(dtype=pred_eta.dtype, device=device)
+        true_p = true_pt * torch.cosh(true_eta)
         true_phi = target_parent_p4["phi"].to(dtype=pred_phi.dtype, device=device)
         true_energy = target_parent_p4["energy"].to(
             dtype=pred_energy.dtype, device=device
@@ -558,7 +560,7 @@ class SetCriterion(nn.Module):
         pred_parent_kinematics = torch.stack(
             [
                 torch.log(
-                    pred_pt.clamp_min(1e-6) / true_pt.clamp_min(1e-6)
+                    pred_p.clamp_min(1e-6) / true_p.clamp_min(1e-6)
                 ).clamp(-5.0, 5.0),
                 delta_theta,
                 delta_phi,
@@ -847,7 +849,7 @@ class SetCriterion(nn.Module):
         else:
             loss_kinematics = pred_logits.new_zeros(())
             kin_components = {
-                "log_pt": pred_logits.new_zeros(()),
+                "log_p": pred_logits.new_zeros(()),
                 "delta_theta": pred_logits.new_zeros(()),
                 "delta_phi": pred_logits.new_zeros(()),
                 "log_mass": pred_logits.new_zeros(()),
@@ -1293,7 +1295,7 @@ class SetCriterion(nn.Module):
             "loss_objectness": loss_objectness,
             "loss_tau_id": loss_tau_id,
             "loss_kinematics": loss_kinematics,
-            "kinematics_log_pt_loss": kin_components["log_pt"],
+            "kinematics_log_p_loss": kin_components["log_p"],
             "kinematics_delta_theta_loss": kin_components["delta_theta"],
             "kinematics_delta_phi_loss": kin_components["delta_phi"],
             "kinematics_log_mass_loss": kin_components["log_mass"],
@@ -1406,6 +1408,10 @@ class ParTauDETRModule(L.LightningModule):
             num_charge_classes=num_charge_classes,
             num_meson_classes=self.num_meson_classes,
             num_kinematics_components=self.num_kinematics_components,
+            angular_scales=(
+                float(arch.tau_loss.kinematics_scales.delta_theta),
+                float(arch.tau_loss.kinematics_scales.delta_phi),
+            ),
             # encoder
             num_layers=int(encoder_cfg.num_layers),
             num_heads=num_heads,
@@ -1760,8 +1766,8 @@ class ParTauDETRModule(L.LightningModule):
             on_epoch=True,
         )
         self.log(
-            "train_losses/kinematics_log_pt_loss",
-            losses["kinematics_log_pt_loss"],
+            "train_losses/kinematics_log_p_loss",
+            losses["kinematics_log_p_loss"],
             on_step=False,
             on_epoch=True,
         )
@@ -2144,8 +2150,8 @@ class ParTauDETRModule(L.LightningModule):
             on_epoch=True,
         )
         self.log(
-            "val_losses/kinematics_log_pt_loss",
-            losses["kinematics_log_pt_loss"],
+            "val_losses/kinematics_log_p_loss",
+            losses["kinematics_log_p_loss"],
             on_step=False,
             on_epoch=True,
         )

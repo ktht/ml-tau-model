@@ -44,8 +44,8 @@ LOG_CLAMP = 5.0  # the dataloaders clip the log-ratio targets to +-LOG_CLAMP
 
 def load_targets(
     model: str, split: str, max_entries: int, overrides: list
-) -> tuple[np.ndarray, np.ndarray]:
-    """Kinematics targets and matching reconstructed-jet eta values."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Kinematics targets and matching reconstructed-jet kinematics."""
     config_name = "main" if model == "ParT" else "main_ParTauDETR"
     with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
         cfg = compose(config_name=config_name, overrides=overrides)
@@ -59,21 +59,29 @@ def load_targets(
     datamodule.setup("fit")
     loader = {"train": datamodule.train_dataloader, "val": datamodule.val_dataloader}[split]()
 
-    chunks, jet_eta_chunks, n = [], [], 0
+    chunks, jet_pt_chunks, jet_eta_chunks, jet_energy_chunks, n = [], [], [], [], 0
     for batch in loader:
         targets = batch[2]
+        jet_pt = batch[6]["pt"]
         jet_eta = batch[6]["eta"]
+        jet_energy = batch[6]["energy"]
         if model == "ParT":
             keep = targets["is_tau"].bool()
             kin = targets["kinematics"][keep]
+            jet_pt = jet_pt[keep]
             jet_eta = jet_eta[keep]
+            jet_energy = jet_energy[keep]
         else:
             # Only signal jets have daughters; padded daughter slots are masked.
             daughter_mask = targets["particles_mask"]
             kin = targets["particles_kinematics"][daughter_mask]
+            jet_pt = jet_pt[:, None].expand_as(daughter_mask)[daughter_mask]
             jet_eta = jet_eta[:, None].expand_as(daughter_mask)[daughter_mask]
+            jet_energy = jet_energy[:, None].expand_as(daughter_mask)[daughter_mask]
         chunks.append(kin.double().numpy())
+        jet_pt_chunks.append(jet_pt.double().numpy())
         jet_eta_chunks.append(jet_eta.double().numpy())
+        jet_energy_chunks.append(jet_energy.double().numpy())
         n += len(kin)
         print(f"\r  read {n:,} targets", end="", flush=True)
         if n >= max_entries:
@@ -81,7 +89,12 @@ def load_targets(
     print()
     if not chunks or n == 0:
         sys.exit("No targets read; check dataset.data_dir and the sample selection.")
-    return np.concatenate(chunks)[:max_entries], np.concatenate(jet_eta_chunks)[:max_entries]
+    return (
+        np.concatenate(chunks)[:max_entries],
+        np.concatenate(jet_pt_chunks)[:max_entries],
+        np.concatenate(jet_eta_chunks)[:max_entries],
+        np.concatenate(jet_energy_chunks)[:max_entries],
+    )
 
 
 def spreads(x: np.ndarray) -> dict:
@@ -95,9 +108,18 @@ def spreads(x: np.ndarray) -> dict:
     }
 
 
-def summarize(kin: np.ndarray, jet_eta: np.ndarray, model: str) -> dict:
+def summarize(
+    kin: np.ndarray,
+    jet_pt: np.ndarray,
+    jet_eta: np.ndarray,
+    jet_energy: np.ndarray,
+    model: str,
+) -> dict:
     """Spreads of every quantity the loss components are built from."""
     if model == "DETR":
+        jet_theta = 2.0 * np.arctan(np.exp(-jet_eta))
+        daughter_theta = jet_theta + kin[:, 1]
+        daughter_eta = -np.log(np.tan(daughter_theta / 2.0))
         quantities = {
             "log_pt": kin[:, 0],
             "delta_theta": kin[:, 1],
@@ -118,6 +140,16 @@ def summarize(kin: np.ndarray, jet_eta: np.ndarray, model: str) -> dict:
             "chord_to_axis": 2.0 * np.abs(np.sin(dphi / 2.0)),
             "log_mass": kin[:, 4],
         }
+    jet_momentum = jet_pt * np.cosh(jet_eta)
+    jet_mass = np.sqrt(np.maximum(jet_energy**2 - jet_momentum**2, 0.0))
+    target_pt = np.exp(kin[:, 0]) * jet_pt
+    target_momentum = target_pt * np.cosh(daughter_eta)
+    target_mass = np.exp(kin[:, 3 if model == "DETR" else 4]) * jet_mass
+    target_energy = np.sqrt(target_momentum**2 + target_mass**2)
+    quantities["log_energy"] = np.log(np.maximum(target_energy / jet_energy, np.finfo(float).tiny))
+    quantities["log_momentum"] = np.log(
+        np.maximum(target_momentum / jet_momentum, np.finfo(float).tiny)
+    )
     table = {name: spreads(x) for name, x in quantities.items()}
     for name in ("log_pt", "log_mass"):
         table[name]["clamped"] = float(np.mean(np.abs(quantities[name]) >= LOG_CLAMP - 1e-6))
@@ -135,8 +167,10 @@ def main():
     overrides = [o for o in overrides if o != "--"]
 
     print(f"[{args.model}] reading {args.split} targets (max {args.max_entries:,})")
-    kin, jet_eta = load_targets(args.model, args.split, args.max_entries, overrides)
-    table = summarize(kin, jet_eta, args.model)
+    kin, jet_pt, jet_eta, jet_energy = load_targets(
+        args.model, args.split, args.max_entries, overrides
+    )
+    table = summarize(kin, jet_pt, jet_eta, jet_energy, args.model)
 
     what = "visible taus" if args.model == "ParT" else "tau daughters"
     print(f"\n{len(kin):,} {what}\n")
@@ -157,6 +191,8 @@ def main():
         print(f"    delta_eta: {table['delta_eta'][e]:.3g}")
         print(f"    phi_chord: {table['delta_phi'][e]:.3g}    # spread of dphi; chord ~ |dphi| for collimated targets")
     print(f"    log_mass: {table['log_mass'][e]:.3g}")
+    print(f"    log_energy: {table['log_energy'][e]:.3g}")
+    print(f"    log_momentum: {table['log_momentum'][e]:.3g}")
 
 
 if __name__ == "__main__":

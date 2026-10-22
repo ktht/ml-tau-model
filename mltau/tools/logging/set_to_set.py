@@ -188,7 +188,7 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, fixed_mass=None):
     latter so that `log_all_kinematics_metrics` can be reused unchanged.
 
     Args:
-        kin:    [B, S, 4] daughter kinematics with delta-phi, or legacy
+        kin:    [B, S, 4] daughter kinematics with log-p and delta-phi, or legacy
                 [B, S, 5] kinematics with sin/cos delta-phi
         charge: [B, S] integer charge in {-1, 0, +1}
         pdg:    [B, S] absolute PDG id
@@ -201,16 +201,20 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, fixed_mass=None):
     eta_jet = reco_jet["eta"]
     phi_jet = reco_jet["phi"]
 
-    pt = torch.exp(kin[..., 0]) * pt_jet[:, None]
     if kin.shape[-1] == 4:
+        momentum = torch.exp(kin[..., 0]) * (pt_jet * torch.cosh(eta_jet))[:, None]
         theta_jet = 2.0 * torch.atan(torch.exp(-eta_jet))
         theta = (theta_jet[:, None] + kin[..., 1]).clamp(
             1e-6, np.pi - 1e-6
         )
-        eta = -torch.log(torch.tan(theta / 2.0))
+        pt = momentum * torch.sin(theta)
+        daughter_pz = momentum * torch.cos(theta)
         daughter_d_phi = kin[..., 2]
     elif kin.shape[-1] == 5:
+        pt = torch.exp(kin[..., 0]) * pt_jet[:, None]
         eta = kin[..., 1] + eta_jet[:, None]
+        momentum = pt * torch.cosh(eta)
+        daughter_pz = pt * torch.sinh(eta)
         daughter_d_phi = torch.atan2(kin[..., 2], kin[..., 3])
     else:
         raise ValueError(
@@ -221,7 +225,7 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, fixed_mass=None):
     mask = valid.to(pt.dtype)
     px = (pt * torch.cos(phi) * mask).sum(-1)
     py = (pt * torch.sin(phi) * mask).sum(-1)
-    pz = (pt * torch.sinh(eta) * mask).sum(-1)
+    pz = (daughter_pz * mask).sum(-1)
     mass_jet = torch.sqrt(
         torch.clamp(
             reco_jet["energy"] ** 2 - (pt_jet * torch.cosh(eta_jet)) ** 2, min=0.0
@@ -234,7 +238,7 @@ def daughters_to_jet_level(kin, charge, pdg, valid, reco_jet, fixed_mass=None):
         else torch.exp(kin[..., mass_index]) * mass_jet[:, None]
     )
     energy = (
-        torch.sqrt((pt * torch.cosh(eta)) ** 2 + daughter_mass**2) * mask
+        torch.sqrt(momentum**2 + daughter_mass**2) * mask
     ).sum(-1)
 
     pt_tau = torch.sqrt(px**2 + py**2 + eps)

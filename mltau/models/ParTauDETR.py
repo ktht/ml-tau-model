@@ -20,11 +20,11 @@ def decode_kinematics(
     """Decode ParTauDETR kinematics into Cartesian four-momenta.
 
     ``kinematics`` has final dimension
-    ``[log_pt_ratio, delta_theta, delta_phi, log_mass_ratio]``.
+    ``[log_p_ratio, delta_theta, delta_phi, log_mass_ratio]``.
     Reference tensors may omit trailing object dimensions, such as a ``[B]``
     jet reference used with ``[B, Q, 4]`` kinematics.
 
-    ``fixed_mass`` (same shape as the decoded pt) replaces the regressed
+    ``fixed_mass`` (same shape as the decoded momentum) replaces the regressed
     log-mass-ratio channel entirely: a daughter's mass is set by its identity
     (a charged pion's 139.6 MeV, a neutral's 135 MeV), so when the mass channel
     is unsupervised (kinematics_weights.log_mass = 0) the physical mass comes
@@ -44,24 +44,25 @@ def decode_kinematics(
     reference_phi = expand_reference(reference_phi)
     reference_energy = expand_reference(reference_energy)
 
+    reference_p = reference_pt * torch.cosh(reference_eta)
     reference_mass = torch.sqrt(
         torch.clamp(
-            reference_energy**2 - (reference_pt * torch.cosh(reference_eta)) ** 2,
+            reference_energy**2 - reference_p**2,
             min=1e-12,
         )
     )
-    log_pt_ratio = kinematics[..., 0]
+    log_p_ratio = kinematics[..., 0]
     log_mass_ratio = kinematics[..., 3]
     if clamp_log_ratios:
-        log_pt_ratio = log_pt_ratio.clamp(-5.0, 5.0)
+        log_p_ratio = log_p_ratio.clamp(-5.0, 5.0)
         log_mass_ratio = log_mass_ratio.clamp(-5.0, 5.0)
 
-    pt = torch.exp(log_pt_ratio) * reference_pt
+    momentum = torch.exp(log_p_ratio) * reference_p
     reference_theta = 2.0 * torch.atan(torch.exp(-reference_eta))
     theta = reference_theta + kinematics[..., 1]
     theta_eps = torch.finfo(kinematics.dtype).eps
     theta = theta.clamp(theta_eps, math.pi - theta_eps)
-    eta = -torch.log(torch.tan(theta / 2.0))
+    pt = momentum * torch.sin(theta)
     phi = reference_phi + kinematics[..., 2]
     if fixed_mass is not None:
         mass = fixed_mass.to(dtype=kinematics.dtype, device=kinematics.device)
@@ -72,8 +73,8 @@ def decode_kinematics(
         [
             pt * torch.cos(phi),
             pt * torch.sin(phi),
-            pt * torch.sinh(eta),
-            torch.sqrt((pt * torch.cosh(eta)) ** 2 + mass**2),
+            momentum * torch.cos(theta),
+            torch.sqrt(momentum**2 + mass**2),
         ],
         dim=-1,
     )
@@ -139,6 +140,7 @@ class ParTauDETR(ParticleTransformer):
         return_memory: bool = False,
         return_cls: bool = False,
         aux_loss: bool = False,
+        angular_scales: tuple[float, float] = (1.0, 1.0),
         **kwargs,
     ):
         super().__init__(
@@ -171,6 +173,9 @@ class ParTauDETR(ParticleTransformer):
         self.return_cls = return_cls
         self.tau_id_head = tau_id_head
         self.aux_loss = aux_loss
+        self.register_buffer(
+            "angular_scales", torch.tensor(angular_scales), persistent=False
+        )
 
         embed_dim = embed_dims[-1] if len(embed_dims) > 0 else input_dim
         decoder_heads = (
@@ -218,10 +223,11 @@ class ParTauDETR(ParticleTransformer):
         else:
             self.tau_head = None
 
-    @staticmethod
-    def _bound_kinematics_angles(kinematics: torch.Tensor) -> torch.Tensor:
+    def _bound_kinematics_angles(self, kinematics: torch.Tensor) -> torch.Tensor:
         angle_limit = math.pi / 2.0
-        bounded_angles = angle_limit * torch.tanh(kinematics[..., 1:3])
+        bounded_angles = angle_limit * torch.tanh(
+            kinematics[..., 1:3] * self.angular_scales.to(kinematics.dtype) / angle_limit
+        )
         return torch.cat(
             (kinematics[..., :1], bounded_angles, kinematics[..., 3:]), dim=-1
         )

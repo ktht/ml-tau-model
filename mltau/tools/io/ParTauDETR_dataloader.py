@@ -30,7 +30,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     Targets are replaced with daughter-level set targets:
       - particles_mask: [N, T] (True for valid daughter)
       - particles_kinematics: [N, T, 4] =
-          [log(pt_dau/pt_jet), delta_theta(dau-jet), delta_phi(dau-jet), log(m_dau/m_jet)]
+          [log(p_dau/p_jet), delta_theta(dau-jet), delta_phi(dau-jet), log(m_dau/m_jet)]
       - particles_charge_ohe: [N, T, 3] one-hot for charges [-1, 0, +1]
       - particles_meson_class_ohe: [N, T, C] one-hot over configured meson classes
 
@@ -399,7 +399,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
             # Daughter kinematic targets in the same spirit as ParT kinematics_tensor.
             _LOG_CLAMP = 5.0
-            jet_pt_2d = np.maximum(jet_pt[:, None], eps)
+            jet_p_2d = np.maximum((jet_pt * np.cosh(jet_eta))[:, None], eps)
             jet_eta_2d = jet_eta[:, None]
             jet_phi_2d = jet_phi[:, None]
             jet_mass = np.sqrt(
@@ -419,8 +419,10 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             daughter_dphi = np.clip(
                 daughter_dphi, -np.pi / 2.0, np.pi / 2.0
             )
-            daughter_log_pt_ratio = np.clip(
-                np.log(np.maximum(dau_pt / jet_pt_2d, eps)), -_LOG_CLAMP, _LOG_CLAMP
+            daughter_log_p_ratio = np.clip(
+                np.log(np.maximum(dau_pt * np.cosh(dau_eta) / jet_p_2d, eps)),
+                -_LOG_CLAMP,
+                _LOG_CLAMP,
             )
             daughter_mass = np.sqrt(
                 np.maximum(dau_energy**2 - (dau_pt * np.cosh(dau_eta)) ** 2, 0.0)
@@ -433,7 +435,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
             daughter_kinematics_np = np.stack(
                 [
-                    daughter_log_pt_ratio,
+                    daughter_log_p_ratio,
                     daughter_dtheta,
                     daughter_dphi,
                     daughter_log_mass_ratio,

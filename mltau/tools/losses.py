@@ -196,14 +196,14 @@ class TauLoss(nn.Module):
             scale = lambda name: scales.get(name, 1.0)
             weights = self.kinematics_weights
             component_weights = {
-                "log_pt": weights.get("log_pt", 1.0),
+                "log_p": weights.get("log_p", 1.0),
                 "delta_theta": weights.get("delta_theta", 1.0),
                 "delta_phi": weights.get("delta_phi", 1.0),
                 "log_mass": weights.get("log_mass", self.l_m),
             }
-            log_pt_loss = self.kin_loss_fn(
-                predictions[:, 0] / scale("log_pt"),
-                targets[:, 0] / scale("log_pt"),
+            log_p_loss = self.kin_loss_fn(
+                predictions[:, 0] / scale("log_p"),
+                targets[:, 0] / scale("log_p"),
             )
             delta_theta_loss = self.kin_loss_fn(
                 predictions[:, 1] / scale("delta_theta"),
@@ -219,13 +219,13 @@ class TauLoss(nn.Module):
             )
             weight_sum = sum(component_weights.values()) + 1e-12
             per_sample_loss = (
-                component_weights["log_pt"] * log_pt_loss
+                component_weights["log_p"] * log_p_loss
                 + component_weights["delta_theta"] * delta_theta_loss
                 + component_weights["delta_phi"] * delta_phi_loss
                 + component_weights["log_mass"] * log_mass_loss
             ) / weight_sum
             return per_sample_loss, {
-                "log_pt": log_pt_loss,
+                "log_p": log_p_loss,
                 "delta_theta": delta_theta_loss,
                 "delta_phi": delta_phi_loss,
                 "log_mass": log_mass_loss,

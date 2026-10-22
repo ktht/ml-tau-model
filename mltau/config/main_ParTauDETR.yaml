@@ -97,13 +97,13 @@ model:
             cost_charge: 1.0
             cost_meson_class_ce: 1.0
             # Per-component weights over
-            # [log_pt_ratio, delta_theta, delta_phi, log_mass_ratio].
+            # [log_p_ratio, delta_theta, delta_phi, log_mass_ratio].
             # These decide WHICH daughter a query is trained towards, so what
             # matters is not that every component counts equally but that the
             # assignment stays stable while the model is still wrong. Tau
-            # daughters are collimated (measured on z_train: sigma =
-            # [0.875, 0.0372, 0.0749, 1.04]), so while the angular error is
-            # of order sigma, position cannot tell two daughters apart and pt
+            # daughters are collimated (angular sigma on z_train =
+            # [0.0372, 0.0749]), so while the angular error is
+            # of order sigma, position cannot tell two daughters apart and momentum
             # and identity -- learned first -- have to carry the decision.
             # Angles at 1/sigma (20) drowned them out: on synthetic daughters
             # with 1-sigma noise the intended assignment was recovered 71% of
@@ -208,8 +208,8 @@ model:
         # "error in units of the spread of its own target" and the weights below
         # can all be 1.
         #
-        # Measured on the daughter targets of z_train (1M daughters):
-        #   log_pt_ratio   sigma 0.875
+        # Angular and mass scales measured on z_train (1M daughters):
+        #   log_p_ratio    sigma 0.874
         #   delta_theta    sigma 0.0372
         #   delta_phi      sigma 0.0749
         #   log_mass_ratio sigma 1.04
@@ -217,7 +217,7 @@ model:
         # they are properties of the data, not tuning knobs. To reproduce the numbers:
         # ./run.sh python mltau/scripts/measure_kinematics_scales.py --model DETR
         kinematics_scales:
-            log_pt: 0.875
+            log_p: 0.874
             delta_theta: 0.0372
             delta_phi: 0.0749
             log_mass: 1.04
@@ -227,7 +227,7 @@ model:
         # identity, the other 95% is the jet mass, which every query in the jet
         # would be re-deriving. See the note in the loss docstring.
         kinematics_weights:
-            log_pt: 1.0
+            log_p: 1.0
             delta_theta: 1.0
             delta_phi: 1.0
             # 0 with detr.loss.mass_from_meson_class (see there).
