@@ -526,7 +526,7 @@ class RegressionMultiEvaluator:
         self.resolution_2d_plots = {}
         self.resolution_performance_info = {}
 
-    def combine_results(self, evaluators: list):
+    def combine_results(self, evaluators: list, plot_pred_vs_true_2d: bool = True):
         for evaluator in evaluators:
             self.response_lineplot.add_line(
                 evaluator.bin_centers,
@@ -540,9 +540,10 @@ class RegressionMultiEvaluator:
                 evaluator.algorithm,
                 label="",
             )
-            self.resolution_2d_plots[evaluator.algorithm] = Resolution2DPlot(
-                evaluator.bin_edges, evaluator, xlabel=self.var_cfg.response_plot.xlabel
-            )
+            if plot_pred_vs_true_2d:
+                self.resolution_2d_plots[evaluator.algorithm] = Resolution2DPlot(
+                    evaluator.bin_edges, evaluator, xlabel=self.var_cfg.response_plot.xlabel
+                )
             self.bin_distributions_plots[evaluator.algorithm] = RangeContentPlot(
                 evaluator.bin_edges,
                 xlabel=self.var_cfg.response_plot.xlabel,
@@ -566,12 +567,11 @@ class RegressionMultiEvaluator:
                 self.output_dir, f"{algorithm}_{self.sample}_2D_resolution.pdf"
             )
             res_2d_plot.save(res_2d_plot_output_path)
+        for algorithm, bin_plot in self.bin_distributions_plots.items():
             bin_distributions_plot_output_path = os.path.join(
                 self.output_dir, f"{algorithm}_{self.sample}_bin_contents.pdf"
             )
-            self.bin_distributions_plots[algorithm].save(
-                bin_distributions_plot_output_path
-            )
+            bin_plot.save(bin_distributions_plot_output_path)
         resolution_performance_info_path = os.path.join(
             self.output_dir, "performance_info.json"
         )
@@ -711,12 +711,14 @@ class KinematicsMultiEvaluator:
         )
         return plots
 
-    def combine_results(self, evaluators: list):
+    def combine_results(self, evaluators: list, plot_pred_vs_true_2d: bool = True):
         for variable in self.variables:
             var_evaluators = [
                 evaluator.var_evaluators[variable] for evaluator in evaluators
             ]
-            self.multi_evaluators[variable].combine_results(var_evaluators)
+            self.multi_evaluators[variable].combine_results(
+                var_evaluators, plot_pred_vs_true_2d=plot_pred_vs_true_2d
+            )
         for evaluator in evaluators:
             var_evaluator = evaluator.var_evaluators["deltaR"]
             self.multi_evaluators["deltaR"].add_line(

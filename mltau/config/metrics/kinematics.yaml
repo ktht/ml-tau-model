@@ -10,14 +10,14 @@ kinematics:
             all: [5, 10, 15, 20, 25, 30, 35, 40, 45]
         resolution_plot:
             ylabel: "$p_T^{vis}\\ resol.\\ (q_{75} - q_{25})/q_{50}$"
-            ylim: [0, 0.06]
+            ylim: [0, 0.05]
             xlabel: "$p_T^{gen-vis}$ [GeV]"
             xscale: "linear"
             yscale: "linear"
             nticks: 7
         response_plot:
             ylabel: "$p_T^{vis}\\ scale\\ (q_{50})$"
-            ylim:  [0.90, 1.1]
+            ylim:  [0.98, 1.02]
             xlabel: "$p_T^{gen-vis}$ [GeV]"
             xscale: "linear"
             yscale: "linear"
@@ -36,7 +36,7 @@ kinematics:
             nticks: 7
         response_plot:
             ylabel: "$\\theta^{vis}\\ scale\\ (q_{50})$"
-            ylim: [-0.05, 0.05]
+            ylim: [-0.01, 0.03]
             xlabel: "$\\theta^{gen-vis}$ [deg]"
             xscale: "linear"
             yscale: "linear"
@@ -48,14 +48,14 @@ kinematics:
             all: [-180, -150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150, 180]
         resolution_plot:
             ylabel: "$\\phi^{vis}\\ resol.\\ (q_{75} - q_{25})$"
-            ylim: [0, 0.5]
+            ylim: [0, 0.1]
             xlabel: "$\\phi^{gen-vis}$ [deg]"
             xscale: "linear"
             yscale: "linear"
             nticks: 7
         response_plot:
             ylabel: "$\\phi^{vis}\\ scale\\ (q_{50})$"
-            ylim: [-0.05, 0.05]
+            ylim: [-0.01, 0.01]
             xlabel: "$\\phi^{gen-vis}$ [deg]"
             xscale: "linear"
             yscale: "linear"
@@ -67,14 +67,14 @@ kinematics:
             all: [-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5]
         resolution_plot:
             ylabel: "$\\eta^{vis}\\ resol.\\ (q_{75} - q_{25})$"
-            ylim: [0, 0.05]
+            ylim: [0, 0.02]
             xlabel: "$\\eta^{gen-vis}$"
             xscale: "linear"
             yscale: "linear"
             nticks: 7
         response_plot:
             ylabel: "$\\eta^{vis}\\ scale\\ (q_{50})$"
-            ylim: [-0.005, 0.005]
+            ylim: [-0.001, 0.001]
             xlabel: "$\\eta^{gen-vis}$"
             xscale: "linear"
             yscale: "linear"
@@ -105,14 +105,14 @@ kinematics:
             all: [5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
         resolution_plot:
             ylabel: "$E^{vis}\\ resol.\\ (q_{75} - q_{25})/q_{50}$"
-            ylim: [0, 0.10]
+            ylim: [0, 0.06]
             xlabel: "$E^{gen-vis}$ [GeV]"
             xscale: "linear"
             yscale: "linear"
             nticks: 7
         response_plot:
             ylabel: "$E^{vis}\\ scale\\ (q_{50})$"
-            ylim: [0.90, 1.10]
+            ylim: [0.98, 1.02]
             xlabel: "$E^{gen-vis}$ [GeV]"
             xscale: "linear"
             yscale: "linear"
@@ -121,7 +121,7 @@ kinematics:
         content_xlim: [0.0, 0.25]
         median_plot:
             ylabel: "Median $\\Delta R$"
-            ylim: [0, 0.02]
+            ylim: [0, 0.008]
             xlabel: "$p_T^{gen-vis}$ [GeV]"
             xscale: "linear"
             yscale: "linear"

@@ -45,11 +45,13 @@ def plot_performance(
         markersize=5,
         label="Truth",
     )
-    for name, pred_hist in pred_hists.items():
+    line_styles = ["solid", "dashed", "dashdot", "dotted"]
+    for index, (name, pred_hist) in enumerate(pred_hists.items()):
         eb = ax.errorbar(
             bin_centers,
             pred_hist,
             fmt="o",
+            linestyle=line_styles[index % len(line_styles)],
             markersize=5,
             label=name,
         )
