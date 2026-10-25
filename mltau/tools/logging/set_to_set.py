@@ -596,8 +596,8 @@ class ThresholdCalibrationBuffer:
     def reset(self) -> None:
         self.batches.clear()
 
-        def add(self, scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged,
-            *, pred_pdg=None, true_pdg=None) -> None:
+    def add(self, scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged,
+        *, pred_pdg=None, true_pdg=None) -> None:
         self.batches.append({
             "scores": scores.detach().float().cpu().numpy(),
             "pred_eta": pred_eta.detach().float().cpu().numpy(),
