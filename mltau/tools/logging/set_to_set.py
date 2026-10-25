@@ -73,18 +73,19 @@ from mltau.tools.logging.general import log_metrics_dict
 # a set model can express and a 6-class reduced scheme cannot, and it is the
 # class most likely to vanish from a validation draw. It is one row rather than
 # five because the neutral multiplicity of a per-mille class is not measurable.
-# Leptonic decays carry their own upstream id and get a row as well.
+# Leptonic decays are split by daughter species into electron and muon rows.
 # Even-prong reconstructions -- 2 or 4 charged daughters, which no tau decay
 # produces -- are not rows: they are predictions that cannot be right, and they
 # get predicted-only columns below.
 _GRID_MODES = [0, 1, 2, 3, 4, 10, 11, 12, 13, 14]
 _FIVE_PRONG_ROW = len(_GRID_MODES)
-_LEPTONIC_ROW = _FIVE_PRONG_ROW + 1
-_RARE_ROW = _LEPTONIC_ROW + 1
+_ELECTRON_ROW = _FIVE_PRONG_ROW + 1
+_MUON_ROW = _ELECTRON_ROW + 1
+_RARE_ROW = _MUON_ROW + 1
 DECAY_MODE_LABELS = (
     [f"1h{n}p" for n in range(5)]
     + [f"3h{n}p" for n in range(5)]
-    + ["5h", "lep", "rare"]
+    + ["5h", "electron", "muon", "rare"]
 )
 # Columns that exist only on the PREDICTED axis. Pooling even-prong predictions
 # into "other" would hide a failure that says something specific -- a lost or
@@ -98,7 +99,7 @@ def category_index(mode, n_charged, n_lepton, n_other):
     """
     Row of each jet in DECAY_MODE_LABELS, or -1 if it has none.
 
-    `mode` is the upstream id with the extended rare value. The prong count is
+    `mode` is the derived id, including -2/-3 for electrons/muons. The prong count is
     needed alongside because the id alone cannot say "five prongs": upstream
     returns `rare` for anything above three.
     """
@@ -109,7 +110,8 @@ def category_index(mode, n_charged, n_lepton, n_other):
     hadronic = (np.asarray(n_lepton) == 0) & (np.asarray(n_other) == 0)
     is_rare = mode == tdm.RARE_DECAY_MODE_EXT
     index[is_rare & hadronic & (np.asarray(n_charged) == 5)] = _FIVE_PRONG_ROW
-    index[mode == tdm.LEPTONIC_DECAY_MODE] = _LEPTONIC_ROW
+    index[mode == s2s_eval.ELECTRON_DECAY_MODE] = _ELECTRON_ROW
+    index[mode == s2s_eval.MUON_DECAY_MODE] = _MUON_ROW
     index[is_rare & (index < 0)] = _RARE_ROW
     return index
 
@@ -148,9 +150,9 @@ def _jagged(dense: np.ndarray, valid: np.ndarray) -> ak.Array:
 
 def decay_modes(pdg: np.ndarray, valid: np.ndarray) -> dict:
     """
-    Per-jet decay mode from the selected daughters, through ml-tau-data.
+    Per-jet decay mode from the shared hadronic/leptonic decoder.
 
-    Returns the upstream id (extended rare convention), the daughter counts by
+    Returns the derived id (extended rare convention), the daughter counts by
     category, and the confusion-matrix row. The counts are returned because the
     id alone is ambiguous about the prong count once it says `rare`, and the
     even-prong columns need the count directly.
@@ -158,19 +160,13 @@ def decay_modes(pdg: np.ndarray, valid: np.ndarray) -> dict:
     A jet with no selected daughters has counts of zero and is `rare` upstream;
     for a prediction that is the honest label -- nothing was reconstructed.
     """
-    rows = ak.to_list(_jagged(pdg, valid))
+    daughters = _jagged(pdg, valid)
+    rows = ak.to_list(daughters)
     counts = np.array(
         [tdm.count_daughters(row) for row in rows], dtype=np.int64
     ).reshape(-1, 4)
     n_charged, n_neutral, n_lepton, n_other = (counts[:, i] for i in range(4))
-    mode = np.fromiter(
-        (
-            tdm.decay_mode_from_counts(*row, rare=tdm.RARE_DECAY_MODE_EXT)
-            for row in counts
-        ),
-        dtype=np.int64,
-        count=len(counts),
-    )
+    mode = ak.to_numpy(s2s_eval.get_decay_mode(daughters))
     return {
         "decay_mode": mode,
         "n_charged": n_charged,
@@ -495,20 +491,6 @@ def _assign(p_eta, p_phi, t_eta, t_phi, max_dr):
     return int((dr[rows, cols] <= max_dr).sum())
 
 
-def _decay_mode_correct(n_charged_pred, n_neutral_pred, n_charged_true, n_neutral_true):
-    """
-    Per-jet: does the predicted daughter set map to the true decay mode?
-
-    Decay mode is 5 * (n_charged - 1) + min(n_neutral, 4) in ml-tau-data, so
-    equality of the two counts (neutrals clamped at 4) is equality of the mode.
-    Done on counts rather than through the classifier so the scan stays a few
-    numpy operations per threshold.
-    """
-    return (n_charged_pred == n_charged_true) & (
-        np.minimum(n_neutral_pred, 4) == np.minimum(n_neutral_true, 4)
-    )
-
-
 def _mean_f1(scores, threshold, pred_eta, pred_phi, true_eta, true_phi, true_valid, max_dr):
     """Mean per-jet F1 of dR-matched daughters at one threshold."""
     n_true = true_valid.sum(axis=1)
@@ -531,12 +513,14 @@ def _mean_f1(scores, threshold, pred_eta, pred_phi, true_eta, true_phi, true_val
 def scan_threshold(
     scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged,
     thresholds=None, max_dr: float = 0.4, objective: str = "decay_mode",
+    *, pred_pdg=None, true_pdg=None,
 ):
     """
     Objectness threshold maximising `objective` over true tau jets.
 
-    objective = "decay_mode": fraction of jets whose predicted charged and
-    neutral daughter counts both equal the truth, i.e. decay-mode accuracy.
+    objective = "decay_mode": fraction of jets whose derived decay mode equals
+    the truth, including separate electronic and muonic modes. Supply pred_pdg
+    and true_pdg for leptonic classes; legacy charged flags describe hadrons.
     That is the deliverable, and it is all-or-nothing in the prong count: one
     spurious daughter changes the mode outright.
 
@@ -567,18 +551,22 @@ def scan_threshold(
     true_eta, true_phi, true_valid, true_charged = (
         true_eta[signal], true_phi[signal], true_valid[signal], true_charged[signal]
     )
-    n_charged_true = (true_valid & true_charged).sum(axis=1)
-    n_neutral_true = (true_valid & ~true_charged).sum(axis=1)
+    pred_pdg = (
+        np.where(pred_charged, s2s_eval.CHARGED_HADRON_PDG, s2s_eval.NEUTRAL_HADRON_PDG)
+        if pred_pdg is None else np.asarray(pred_pdg)[signal]
+    )
+    true_pdg = (
+        np.where(true_charged, s2s_eval.CHARGED_HADRON_PDG, s2s_eval.NEUTRAL_HADRON_PDG)
+        if true_pdg is None else np.asarray(true_pdg)[signal]
+    )
+    true_modes = ak.to_numpy(s2s_eval.get_decay_mode(_jagged(true_pdg, true_valid)))
 
     by_threshold = {}
     for threshold in thresholds:
         keep = scores >= threshold
-        n_charged_pred = (keep & pred_charged).sum(axis=1)
-        n_neutral_pred = (keep & ~pred_charged).sum(axis=1)
+        pred_modes = ak.to_numpy(s2s_eval.get_decay_mode(_jagged(pred_pdg, keep)))
         entry = {
-            "decay_mode_accuracy": float(
-                _decay_mode_correct(n_charged_pred, n_neutral_pred, n_charged_true, n_neutral_true).mean()
-            ),
+            "decay_mode_accuracy": float((pred_modes == true_modes).mean()),
         }
         if objective == "f1":
             entry["f1"] = _mean_f1(scores, threshold, pred_eta, pred_phi, true_eta, true_phi, true_valid, max_dr)
@@ -598,8 +586,7 @@ class ThresholdCalibrationBuffer:
     Holds batches for an objectness threshold scan.
 
     Only what the two objectives need is kept: objectness scores, directions
-    for the dR matching, and whether each predicted / true daughter is of a
-    charged class for the decay-mode count.
+    for the dR matching, and representative PDGs for decay-mode classification.
     """
 
     def __init__(self, max_jets: int = 100_000):
@@ -609,7 +596,8 @@ class ThresholdCalibrationBuffer:
     def reset(self) -> None:
         self.batches.clear()
 
-    def add(self, scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged) -> None:
+        def add(self, scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, true_valid, true_charged,
+            *, pred_pdg=None, true_pdg=None) -> None:
         self.batches.append({
             "scores": scores.detach().float().cpu().numpy(),
             "pred_eta": pred_eta.detach().float().cpu().numpy(),
@@ -619,6 +607,16 @@ class ThresholdCalibrationBuffer:
             "true_phi": true_phi.detach().float().cpu().numpy(),
             "true_valid": true_valid.detach().bool().cpu().numpy(),
             "true_charged": true_charged.detach().bool().cpu().numpy(),
+            "pred_pdg": (
+                pred_pdg if pred_pdg is not None else torch.where(
+                    pred_charged, s2s_eval.CHARGED_HADRON_PDG, s2s_eval.NEUTRAL_HADRON_PDG
+                )
+            ).detach().long().cpu().numpy(),
+            "true_pdg": (
+                true_pdg if true_pdg is not None else torch.where(
+                    true_charged, s2s_eval.CHARGED_HADRON_PDG, s2s_eval.NEUTRAL_HADRON_PDG
+                )
+            ).detach().long().cpu().numpy(),
         })
         while sum(len(b["scores"]) for b in self.batches) > self.max_jets and len(self.batches) > 1:
             self.batches.pop(0)
@@ -634,4 +632,5 @@ class ThresholdCalibrationBuffer:
             merged["scores"], merged["pred_eta"], merged["pred_phi"], merged["pred_charged"],
             merged["true_eta"], merged["true_phi"], merged["true_valid"], merged["true_charged"],
             thresholds=thresholds, max_dr=max_dr, objective=objective,
+            pred_pdg=merged["pred_pdg"], true_pdg=merged["true_pdg"],
         )

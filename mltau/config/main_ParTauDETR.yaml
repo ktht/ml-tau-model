@@ -138,6 +138,8 @@ model:
             weight_meson_class: 1.0
             weight_consistency: 1.0
             weight_charge_count: 0.0
+            weight_excess_leptons: 0.0
+            weight_mixed_lepton_hadron: 0.0
             weight_parent_kinematics: 0.0
             weight_parent_charge: 0.0
             weight_parent_decay_mode: 0.0

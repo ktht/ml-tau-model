@@ -12,6 +12,7 @@ from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 from mltau.models.ParTauDETR import decode_kinematics as decode_kinematics_p4
+from mltau.tools.meson_classes import get_meson_classes
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -101,7 +102,9 @@ def _assign(
     return pred_idx[valid].astype(np.int64), true_idx[valid].astype(np.int64)
 
 
-def _predicted_components(outputs, reco_jet_p4s, mass_from_class: bool = False):
+def _predicted_components(
+    outputs, reco_jet_p4s, mass_from_class: bool = False, tau_daughter_pdg_ids=None
+):
     """
     Dense [N, Q] predictions, before any objectness threshold is applied.
 
@@ -110,8 +113,8 @@ def _predicted_components(outputs, reco_jet_p4s, mass_from_class: bool = False):
     per point.
 
     `mass_from_class` decodes each daughter's mass from its predicted meson
-    class (0 = charged -> pi+-, 1 = neutral -> pi0) instead of the regressed
-    log-mass channel; required for models trained with
+    class using tau_daughter_pdg_ids (pion masses for hadrons, physical lepton
+    masses) instead of the regressed log-mass channel; required for models trained with
     tau_loss.kinematics_weights.log_mass = 0, whose mass channel is untrained.
     """
     object_probs = torch.softmax(outputs["pred_logits"], dim=-1)
@@ -126,7 +129,16 @@ def _predicted_components(outputs, reco_jet_p4s, mass_from_class: bool = False):
 
     fixed_mass = None
     if mass_from_class:
-        mass_lut = outputs["pred_kinematics"].new_tensor([0.13957, 0.13498])
+        num_classes = outputs["pred_meson_class_logits"].shape[-1]
+        if tau_daughter_pdg_ids is None:
+            if num_classes != 2:
+                raise ValueError("Provide tau_daughter_pdg_ids for class-based masses with nonlegacy heads.")
+            masses = [0.13957, 0.13498]
+        else:
+            masses = [group.mass for group in get_meson_classes(tau_daughter_pdg_ids)]
+            if len(masses) != num_classes:
+                raise ValueError("Configured daughter classes do not match the prediction head width.")
+        mass_lut = outputs["pred_kinematics"].new_tensor(masses)
         fixed_mass = mass_lut[pred_meson_class]
 
     pred_p4_tensor = decode_kinematics_p4(
@@ -155,6 +167,7 @@ def get_predicted_particles(
     tau_scores=None,
     tau_threshold: float | None = None,
     mass_from_class: bool = False,
+    tau_daughter_pdg_ids=None,
 ):
     """
     Predicted daughters per jet: the queries whose objectness passes
@@ -168,7 +181,8 @@ def get_predicted_particles(
     restricted to true tau jets, where the tagger has nothing to add.
     """
     pred_scores, pred_p4, pred_charge, pred_meson_class = _predicted_components(
-        outputs, reco_jet_p4s, mass_from_class=mass_from_class
+        outputs, reco_jet_p4s, mass_from_class=mass_from_class,
+        tau_daughter_pdg_ids=tau_daughter_pdg_ids,
     )
     pred_mask = pred_scores >= obj_cls_trsh
     if tau_scores is not None and tau_threshold is not None:
@@ -443,6 +457,7 @@ def create_predictions(
         tau_scores=tau_scores(outputs) if tau_threshold is not None else None,
         tau_threshold=tau_threshold,
         mass_from_class=mass_from_class,
+        tau_daughter_pdg_ids=cfg.dataset.tau_daughter_pdg_ids,
     )
     true_daughters = TauDaughter(*targets)
     pred_daughters = TauDaughter(*predictions)
@@ -495,12 +510,17 @@ def scan_thresholds(
     element -- costs about 4 minutes per point at 100k jets, so a 21-point scan
     ran for an hour and a half without tqdm ever advancing past 0/21.
 
-    `cfg` is accepted for call-site compatibility and not used.
+    `cfg` supplies the class ordering and class-based mass setting when provided.
     """
     thresholds = np.linspace(0.9, 0.8, 21) if thresholds is None else np.asarray(thresholds)
 
     scores, pred_p4, pred_charge, pred_meson_class = _predicted_components(
-        outputs, reco_jet_p4s
+        outputs, reco_jet_p4s,
+        mass_from_class=(
+            bool(cfg.model.detr.loss.get("mass_from_meson_class", False))
+            if cfg is not None else False
+        ),
+        tau_daughter_pdg_ids=cfg.dataset.tau_daughter_pdg_ids if cfg is not None else None,
     )
     scores = _to_numpy(scores)  # [N, Q]
     p_eta = ak.to_numpy(pred_p4.eta)  # [N, Q]; dense, nothing masked yet

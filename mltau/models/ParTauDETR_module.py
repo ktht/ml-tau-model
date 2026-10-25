@@ -10,10 +10,17 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
 from mltau.models.ParTauDETR import ParTauDETR
+from mltau.tools.evaluation.set_to_set_models import NEUTRAL_HADRON_PDG
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
-from mltau.tools.meson_classes import MesonClass, get_meson_classes
+from mltau.tools.meson_classes import (
+    ELECTRON_PDG,
+    MUON_PDG,
+    STORED_LEPTONIC_DECAY_MODE,
+    MesonClass,
+    get_meson_classes,
+)
 from mltau.models.ParTauDETR import decode_kinematics
 
 try:  # scipy's LAPJVsp solver is ~10x faster than the pure-python fallback below
@@ -422,6 +429,8 @@ class SetCriterion(nn.Module):
         object_class_index: int = 0,
         eos_coef: float = 0.1,
         ignore_index: int = -100,
+        loss_excess_leptons_weight: float = 0.0,
+        loss_mixed_lepton_hadron_weight: float = 0.0,
     ):
         super().__init__()
         self.matcher = matcher
@@ -440,6 +449,8 @@ class SetCriterion(nn.Module):
         self.loss_soft_parent_charge_weight = loss_soft_parent_charge_weight
         self.loss_soft_parent_decay_mode_weight = loss_soft_parent_decay_mode_weight
         self.loss_aux_weight = loss_aux_weight
+        self.loss_excess_leptons_weight = loss_excess_leptons_weight
+        self.loss_mixed_lepton_hadron_weight = loss_mixed_lepton_hadron_weight
         if not 0.0 < parent_objectness_temperature < 1.0:
             raise ValueError("parent_objectness_temperature must be between 0 and 1.")
         self.parent_objectness_temperature = parent_objectness_temperature
@@ -457,21 +468,27 @@ class SetCriterion(nn.Module):
                 valid[charge + 1, meson_class_index] = 1.0
         self.charge_meson_class_valid: torch.Tensor
         self.register_buffer("charge_meson_class_valid", valid)
+        self.lepton_class_mask: torch.Tensor
+        self.register_buffer(
+            "lepton_class_mask",
+            torch.tensor([
+                meson_class.representative_pdg in {ELECTRON_PDG, MUON_PDG}
+                for meson_class in meson_classes
+            ], dtype=torch.bool),
+            persistent=False,
+        )
 
         # Physical mass per meson class, for decoding daughter p4 from the
         # predicted class instead of the regressed log-mass channel
-        # (mass_from_meson_class). A charged class is overwhelmingly pi+-
+        # (mass_from_meson_class). A charged hadron class is overwhelmingly pi+-
         # (139.57 MeV), a neutral one pi0 (134.98 MeV); the handful of
         # kaons/etas this misassigns shift a daughter's energy by well under
-        # a per mille at these momenta.
+        # a per mille at these momenta. Lepton classes use their physical masses.
         self.mass_from_meson_class = bool(mass_from_meson_class)
         self.register_buffer(
             "meson_class_mass",
             torch.tensor(
-                [
-                    0.13498 if set(c.charges) == {0} else 0.13957
-                    for c in meson_classes
-                ],
+                [meson_class.mass for meson_class in meson_classes],
                 dtype=torch.float32,
             ),
             persistent=False,
@@ -486,6 +503,28 @@ class SetCriterion(nn.Module):
         if weights is None:
             return values.mean()
         return (values * weights).sum() / (weights.sum() + 1e-8)
+
+    def _compute_lepton_topology_losses(
+        self,
+        pred_meson_class_logits: torch.Tensor,
+        soft_query_weights: torch.Tensor,
+        signal_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Signal-only excess-lepton and distinct-query lepton/hadron penalties."""
+        probabilities = F.softmax(pred_meson_class_logits.float(), dim=-1)
+        lepton_presence = soft_query_weights * probabilities[..., self.lepton_class_mask].sum(-1)
+        hadron_presence = soft_query_weights * probabilities[..., ~self.lepton_class_mask].sum(-1)
+        lepton_count = lepton_presence.sum(-1)
+        excess_leptons = F.relu(lepton_count - 1).square()
+        mixed_lepton_hadron = (
+            lepton_count * hadron_presence.sum(-1)
+            - (lepton_presence * hadron_presence).sum(-1)
+        ).clamp_min(0)
+        weights = signal_mask.to(dtype=probabilities.dtype)
+        return (
+            self._weighted_mean(excess_leptons, weights),
+            self._weighted_mean(mixed_lepton_hadron, weights),
+        )
 
     def _soft_objectness_gate(
         self, pred_logits: torch.Tensor, threshold: torch.Tensor | float
@@ -999,6 +1038,10 @@ class SetCriterion(nn.Module):
         # counts to the tau decay mode. They are signal-only and unweighted,
         # like the daughter losses (class docstring).
         parent_weights = signal_mask.to(dtype=pred_logits.dtype)
+        hadronic_dm_mask = signal_mask & (
+            target_parent_decay_mode.to(device=device) != STORED_LEPTONIC_DECAY_MODE
+        )
+        parent_dm_weights = hadronic_dm_mask.to(dtype=pred_logits.dtype)
 
         # Matched constraints use only queries assigned to true daughters by
         # the Hungarian matcher. Other queries do not contribute to the parent.
@@ -1091,12 +1134,12 @@ class SetCriterion(nn.Module):
             decay_mode_loss = F.cross_entropy(
                 decay_mode_probabilities.clamp_min(1e-8).log(),
                 (target_parent_decay_mode.to(device=device, dtype=torch.long) + decay_mode_stride).masked_fill(
-                    ~signal_mask, self.ignore_index
+                    ~hadronic_dm_mask, self.ignore_index
                 ),
                 reduction="none",
                 ignore_index=self.ignore_index,
             )
-            loss_parent_decay_mode = self._weighted_mean(decay_mode_loss, parent_weights)
+            loss_parent_decay_mode = self._weighted_mean(decay_mode_loss, parent_dm_weights)
         if self.loss_parent_decay_mode_weight > 0:
             total_loss = total_loss + self.loss_parent_decay_mode_weight * loss_parent_decay_mode
 
@@ -1104,15 +1147,17 @@ class SetCriterion(nn.Module):
         # objectness threshold. Queries well above the threshold contribute
         # almost fully, queries well below it contribute almost nothing, and
         # queries near it change smoothly so gradients can pass through.
-        use_soft_parent_constraints = any(
+        use_soft_constraints = any(
             weight > 0
             for weight in (
                 self.loss_soft_parent_kinematics_weight,
                 self.loss_soft_parent_charge_weight,
                 self.loss_soft_parent_decay_mode_weight,
+                self.loss_excess_leptons_weight,
+                self.loss_mixed_lepton_hadron_weight,
             )
         )
-        if use_soft_parent_constraints:
+        if use_soft_constraints:
             soft_query_weights = self._soft_objectness_gate(
                 pred_logits, objectness_threshold
             )
@@ -1121,6 +1166,18 @@ class SetCriterion(nn.Module):
                 soft_query_weights = self._soft_objectness_gate(
                     pred_logits, objectness_threshold
                 )
+
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled()
+            and (self.loss_excess_leptons_weight > 0 or self.loss_mixed_lepton_hadron_weight > 0)
+        ):
+            loss_excess_leptons, loss_mixed_lepton_hadron = self._compute_lepton_topology_losses(
+                pred_meson_class_logits, soft_query_weights, signal_mask
+            )
+        if self.loss_excess_leptons_weight > 0:
+            total_loss = total_loss + self.loss_excess_leptons_weight * loss_excess_leptons
+        if self.loss_mixed_lepton_hadron_weight > 0:
+            total_loss = total_loss + self.loss_mixed_lepton_hadron_weight * loss_mixed_lepton_hadron
 
         hard_query_mask = (
             F.softmax(pred_logits.float(), dim=-1)[..., self.object_class_index]
@@ -1235,12 +1292,12 @@ class SetCriterion(nn.Module):
                 (
                     target_parent_decay_mode.to(device=device, dtype=torch.long)
                     + decay_mode_stride
-                ).masked_fill(~signal_mask, self.ignore_index),
+                ).masked_fill(~hadronic_dm_mask, self.ignore_index),
                 reduction="none",
                 ignore_index=self.ignore_index,
             )
             loss_soft_parent_decay_mode = self._weighted_mean(
-                decay_mode_loss, parent_weights
+                decay_mode_loss, parent_dm_weights
             )
         if self.loss_soft_parent_decay_mode_weight > 0:
             total_loss = (
@@ -1269,6 +1326,8 @@ class SetCriterion(nn.Module):
             "soft_parent_kinematics_count_match_fraction": count_match_fraction,
             "loss_soft_parent_charge": loss_soft_parent_charge,
             "loss_soft_parent_decay_mode": loss_soft_parent_decay_mode,
+            "loss_excess_leptons": loss_excess_leptons,
+            "loss_mixed_lepton_hadron": loss_mixed_lepton_hadron,
             "loss_aux": loss_aux,
             "num_matched": pred_logits.new_tensor(float(num_matched)),
             "num_charge_supervised": num_charge_supervised.to(pred_logits.dtype),
@@ -1429,6 +1488,8 @@ class ParTauDETRModule(L.LightningModule):
             loss_soft_parent_charge_weight=float(detr_cfg.loss.weight_soft_parent_charge),
             loss_soft_parent_decay_mode_weight=float(detr_cfg.loss.weight_soft_parent_decay_mode),
             loss_aux_weight=float(detr_cfg.loss.weight_aux),
+            loss_excess_leptons_weight=float(detr_cfg.loss.get("weight_excess_leptons", 0.0)),
+            loss_mixed_lepton_hadron_weight=float(detr_cfg.loss.get("weight_mixed_lepton_hadron", 0.0)),
             mass_from_meson_class=bool(detr_cfg.loss.get("mass_from_meson_class", False)),
             parent_objectness_temperature=float(detr_cfg.loss.parent_objectness_temperature),
             no_object_class_index=1,
@@ -1447,14 +1508,12 @@ class ParTauDETRModule(L.LightningModule):
 
         # One representative |PDG| per meson class, for the jet-level
         # evaluation: the decay mode is derived by ml-tau-data from PDG ids
-        # classified by property, so a class is handed over as the hadron that
-        # represents it -- 211 for a charged class, 130 for a neutral one, the
-        # same convention the ntupelizer uses when it writes the daughter ids.
+        # classified by property: hadrons use 211/130 and leptons retain 11/13.
         # Not persisted: it is derived from the config, not learned.
         self.register_buffer(
             "meson_class_repr_pdg",
             torch.tensor(
-                [130 if set(c.charges) == {0} else 211 for c in meson_classes],
+                [meson_class.representative_pdg for meson_class in meson_classes],
                 dtype=torch.long,
             ),
             persistent=False,
@@ -1813,6 +1872,14 @@ class ParTauDETRModule(L.LightningModule):
             on_step=False,
             on_epoch=True,
         )
+        self.log(
+            "train_losses/excess_leptons", losses["loss_excess_leptons"],
+            on_step=False, on_epoch=True,
+        )
+        self.log(
+            "train_losses/mixed_lepton_hadron", losses["loss_mixed_lepton_hadron"],
+            on_step=False, on_epoch=True,
+        )
         # Matched pairs per step: if the daughter losses move because the matcher
         # stopped finding targets, this moves with them. on_step as well as
         # on_epoch, because an epoch mean hides a collapse that lasts a chunk.
@@ -1871,11 +1938,12 @@ class ParTauDETRModule(L.LightningModule):
         }
         reco_jet = {k: v[signal] for k, v in reco_jet.items()}
         with torch.no_grad():
-            # Charged or neutral, per predicted and per true daughter: the
-            # decay-mode objective of the scan counts prongs and neutrals.
-            charged_class = self.meson_class_repr_pdg.to(self.device) == 211
-            pred_charged = charged_class[outputs["pred_meson_class_logits"].argmax(-1)]
-            true_charged = charged_class[targets["particles_meson_class_ohe"][signal].argmax(-1)]
+            # Preserve species so calibration distinguishes leptons from hadrons.
+            representative_pdgs = self.meson_class_repr_pdg.to(self.device)
+            pred_pdg = representative_pdgs[outputs["pred_meson_class_logits"].argmax(-1)]
+            true_pdg = representative_pdgs[targets["particles_meson_class_ohe"][signal].argmax(-1)]
+            pred_charged = pred_pdg != NEUTRAL_HADRON_PDG
+            true_charged = true_pdg != NEUTRAL_HADRON_PDG
             scores = torch.softmax(outputs["pred_logits"].float(), dim=-1)[..., 0]
             pred_eta = outputs["pred_kinematics"][..., 1].float() + reco_jet["eta"][:, None]
             pred_phi = reco_jet["phi"][:, None] + torch.atan2(
@@ -1888,7 +1956,8 @@ class ParTauDETRModule(L.LightningModule):
             )
         destination = self.threshold_buffer if buffer is None else buffer
         destination.add(
-            scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, target_mask, true_charged
+            scores, pred_eta, pred_phi, pred_charged, true_eta, true_phi, target_mask, true_charged,
+            pred_pdg=pred_pdg, true_pdg=true_pdg,
         )
 
     def on_validation_start(self) -> None:
@@ -2187,6 +2256,14 @@ class ParTauDETRModule(L.LightningModule):
             losses["loss_soft_parent_decay_mode"],
             on_step=False,
             on_epoch=True,
+        )
+        self.log(
+            "val_losses/excess_leptons", losses["loss_excess_leptons"],
+            on_step=False, on_epoch=True,
+        )
+        self.log(
+            "val_losses/mixed_lepton_hadron", losses["loss_mixed_lepton_hadron"],
+            on_step=False, on_epoch=True,
         )
         for key, value in losses.items():
             if key.startswith(("matching/", "momentum/")):

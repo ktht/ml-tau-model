@@ -71,6 +71,63 @@ A maximum of 20 candidates per jet are used (padded/clipped).
 
 Rare decay modes (15), leptonic decays (16), and background (-1) are all mapped to class 5. Background samples are masked during training so only signal taus contribute to this head. Background is also tagged in a separate `tau_id_head`.
 
+### ParTauDETR Daughter-Derived Modes
+
+DETR derives its decay mode from the predicted daughter set, rather than the
+six-class head above. The default daughter classes, in configuration order, are
+charged hadrons, neutral hadrons, electrons, and muons. Their representative
+PDG IDs are 211, 130, 11, and 13; signed input PDGs are classified by absolute
+value. Older two-class configurations remain supported.
+
+The shared decoder in `mltau/tools/evaluation/set_to_set_models.py` preserves
+the upstream hadronic convention and extended rare ID 30, and adds:
+
+| Derived DM | Category |
+|------------|----------|
+| -2 | Electronic tau decay |
+| -3 | Muonic tau decay |
+
+A leptonic mode requires exactly one electron or muon and no other visible
+species, ignoring photons and neutrinos. Mixed hadron/lepton sets and multiple
+leptons are classified as rare. The parquet column `gen_jet_tau_decaymode`
+continues to use 16 for both leptonic modes; derived truth instead uses daughter
+PDGs. Compare `tau_decaymode` with `gen_jet_tau_decaymode_exp`, not directly with
+the stored parent label. Training metrics, threshold calibration, and the CLI
+evaluator use the separate derived categories.
+
+Both matched and soft parent DM losses exclude stored label 16 from their
+targets and normalization because these losses model only hadronic counts.
+Leptonic jets still supervise daughter identity, objectness, charge, kinematics,
+tau ID, and any enabled parent charge/kinematics constraints.
+
+Two optional topology penalties use the same soft objectness gate as the parent
+constraints. With gate $g_q$, define $\ell_q = g_q[P_q(e)+P_q(\mu)]$ and
+$h_q = g_q[P_q(\text{charged hadron})+P_q(\text{neutral hadron})]$:
+
+- `model.detr.loss.weight_excess_leptons`: weights
+  $[\max(0,\sum_q\ell_q-1)]^2$, counting electrons and muons together.
+- `model.detr.loss.weight_mixed_lepton_hadron`: weights
+  $\sum_{q\ne r}\ell_q h_r$, excluding same-query ambiguity.
+
+Both default to `0.0`, so neither changes the optimization objective unless
+enabled. Their unweighted values are still calculated and logged every epoch
+as `train_losses/excess_leptons`, `train_losses/mixed_lepton_hadron`,
+`val_losses/excess_leptons`, and `val_losses/mixed_lepton_hadron`. Each penalty
+is averaged over genuine tau jets only; a background-only batch contributes
+zero. Configurations without lepton classes also give zero. These are soft
+penalties, not hard inference constraints.
+
+Class-based mass decoding uses pion masses for the two hadron groups and
+electron/muon masses for the lepton groups. `create_predictions` and the CLI
+evaluator pass the configured class ordering automatically. Direct calls to
+`get_predicted_particles(..., mass_from_class=True)` must also pass
+`tau_daughter_pdg_ids=cfg.dataset.tau_daughter_pdg_ids` for the expanded head.
+Without that argument, only the legacy two-class mass lookup is supported.
+
+The four-class daughter head requires retraining. Existing checkpoints remain
+usable with their original class configuration; loading a two-class checkpoint
+into a four-class model requires explicit handling of incompatible head weights.
+
 ## Data
 
 - **Format**: Apache Parquet files, streamed with `awkward-array` using row-group chunking

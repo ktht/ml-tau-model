@@ -4,11 +4,42 @@ from dataclasses import dataclass
 import numpy as np
 
 
+STORED_LEPTONIC_DECAY_MODE = 16
+CHARGED_HADRON_PDG = 211
+NEUTRAL_HADRON_PDG = 130
+ELECTRON_PDG = 11
+MUON_PDG = 13
+
+
 @dataclass(frozen=True)
 class MesonClass:
     name: str
     pdg_ids: tuple[int, ...]
     charges: tuple[int, ...]
+
+    @property
+    def representative_pdg(self) -> int:
+        """Representative species for decay-mode decoding, preserving leptons."""
+        species = set(self.pdg_ids)
+        if species.intersection({ELECTRON_PDG, MUON_PDG}):
+            if species not in ({ELECTRON_PDG}, {MUON_PDG}) or 0 in self.charges:
+                raise ValueError(f"Class '{self.name}' must keep each lepton species separate and charged.")
+            return self.pdg_ids[0]
+        if set(self.charges) == {0}:
+            return NEUTRAL_HADRON_PDG
+        if 0 not in self.charges:
+            return CHARGED_HADRON_PDG
+        raise ValueError(f"Class '{self.name}' mixes neutral and charged particles.")
+
+    @property
+    def mass(self) -> float:
+        """Representative daughter mass in GeV; hadron classes retain pion masses."""
+        return {
+            CHARGED_HADRON_PDG: 0.13957,
+            NEUTRAL_HADRON_PDG: 0.13498,
+            ELECTRON_PDG: 0.000510999,
+            MUON_PDG: 0.1056583755,
+        }[self.representative_pdg]
 
 
 def get_meson_classes(configured_groups: Mapping) -> tuple[MesonClass, ...]:

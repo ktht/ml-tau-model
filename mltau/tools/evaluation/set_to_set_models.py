@@ -1,8 +1,8 @@
 import awkward as ak
 import numpy as np
 
-# The decay mode definition lives in ml-tau-data so that the label derived here
-# and the `gen_jet_tau_decaymode` stored in the ntuples cannot drift apart.  It
+# The hadronic decay mode definition lives in ml-tau-data. Leptonic modes are
+# split by daughter species here; the ntuples retain their combined label. It
 # classifies daughters by particle property rather than by an enumerated PDG
 # list, ignores photons (a radiative decay is classed with its parent mode, as
 # PDG treats them), and ignores neutrinos.
@@ -12,32 +12,28 @@ import numpy as np
 from ntupelizer.tools.tau_decaymode import RARE_DECAY_MODE_EXT, classify_decay_modes
 
 from mltau.tools.general import reinitialize_p4
-from mltau.tools.meson_classes import get_meson_classes
+from mltau.tools.meson_classes import (
+    CHARGED_HADRON_PDG as CHARGED_HADRON_PDG,
+    NEUTRAL_HADRON_PDG as NEUTRAL_HADRON_PDG,
+    ELECTRON_PDG,
+    MUON_PDG,
+    get_meson_classes,
+)
 
-# The set model predicts meson CLASSES, not species. For the decay mode a class
-# is represented by one hadron that stands for it: any charged hadron for a
-# charged class, any neutral hadron for a neutral one. These are the same
+# The set model predicts daughter classes. Hadron classes use a representative
+# charged or neutral hadron; electron and muon classes preserve their PDG IDs.
+# The hadron representatives are the same
 # representative ids the ntupelizer writes into gen_jet_tau_vis_daughter_pdgs
 # (map_pdgid_to_candid), and ml-tau-data classifies them by property, so a
 # class and a stored daughter go through the identical code path.
-CHARGED_HADRON_PDG = 211
-NEUTRAL_HADRON_PDG = 130
+# DM IDs 11/13 already denote hadronic modes; -2/-3 also avoid background -1.
+ELECTRON_DECAY_MODE = -2
+MUON_DECAY_MODE = -3
 
 
 def meson_class_representative_pdgs(tau_daughter_pdg_ids) -> list[int]:
     """One representative |PDG| per configured meson class, in class order."""
-    representatives = []
-    for meson_class in get_meson_classes(tau_daughter_pdg_ids):
-        charges = set(meson_class.charges)
-        if charges == {0}:
-            representatives.append(NEUTRAL_HADRON_PDG)
-        elif 0 not in charges:
-            representatives.append(CHARGED_HADRON_PDG)
-        else:
-            raise ValueError(
-                f"Meson class '{meson_class.name}' mixes neutral and charged particles."
-            )
-    return representatives
+    return [group.representative_pdg for group in get_meson_classes(tau_daughter_pdg_ids)]
 
 
 def meson_class_to_pdg(meson_class, tau_daughter_pdg_ids):
@@ -59,9 +55,21 @@ def get_decay_mode(pdg):
     reconstruction are the same number.  A set model can predict four prongs --
     no tau decays that way, so it is a failure worth seeing -- and 30 keeps it
     visible.  Compare derived with derived: a mode from here is not directly
-    comparable with the ntuple column, which says 15.
+    comparable with the ntuple column, which says 15. Electronic and muonic
+    decays use -2 and -3 respectively; the stored combined leptonic id is 16.
+    Exactly one lepton and no other visible species is required, ignoring
+    photons and neutrinos. Mixed or multiple-lepton sets are rare.
     """
-    return ak.Array(classify_decay_modes(pdg, rare=RARE_DECAY_MODE_EXT))
+    modes = np.asarray(classify_decay_modes(pdg, rare=RARE_DECAY_MODE_EXT)).copy()
+    absolute_pdg = abs(ak.Array(pdg))
+    ignored = (absolute_pdg == 22) | (absolute_pdg == 12) | (absolute_pdg == 14) | (absolute_pdg == 16)
+    visible_count = ak.to_numpy(ak.sum(~ignored, axis=1))
+    electron_count = ak.to_numpy(ak.sum(absolute_pdg == ELECTRON_PDG, axis=1))
+    muon_count = ak.to_numpy(ak.sum(absolute_pdg == MUON_PDG, axis=1))
+    modes[(electron_count + muon_count) > 0] = RARE_DECAY_MODE_EXT
+    modes[(visible_count == 1) & (electron_count == 1)] = ELECTRON_DECAY_MODE
+    modes[(visible_count == 1) & (muon_count == 1)] = MUON_DECAY_MODE
+    return ak.Array(modes)
 
 
 def construct_jet_level_predictions(

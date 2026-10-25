@@ -34,7 +34,7 @@ dataset:
      # generator-level tau after the pT cut. Note that this is only an issue if
      # the pT cut is enabled and weight_parent_* weights are positive.
     tau_daughter_pt_cut: -1.0
-    data_dir: /scratch/persistent/laurits/ml-tau/20261022_FullVertexFix/
+    data_dir: /scratch/persistent/laurits/ml-tau/20261026_leptonicDecay_dataset
 
     # Meson classes for daughter one-hot encoding. Mapping order defines class
     # indices and charges defines valid charge-head combinations. All unlisted
@@ -46,6 +46,12 @@ dataset:
         neutral:
             pdg_ids: [111, 221, 130] # pi0, eta -> yy, K_L0
             charges: [0]
+        electron:
+            pdg_ids: [11]
+            charges: [-1, 1]
+        muon:
+            pdg_ids: [13]
+            charges: [-1, 1]
 
     # Cap how many jets each sample contributes to train+val. Keys are the
     # filename prefixes before "_train" (e.g. z_train_0003.parquet -> "z").

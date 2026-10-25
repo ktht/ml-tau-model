@@ -2,7 +2,7 @@
 
 Computes the object-level numbers arXiv 2606.18460 reports for MultiParTau --
 visible-pT response resolution as IQR/median, median DeltaR(pred, gen),
-decay-mode accuracy/confusion from the predicted daughter counts, tau charge
+decay-mode accuracy/confusion from the predicted daughter species, tau charge
 from the summed daughter charges -- plus daughter-level efficiency/purity/F1
 and matched-daughter residuals on signal jets, and the tau-ID performance of
 the tagging head (ROC, AUC, misID at fixed signal efficiencies) on signal vs
@@ -37,6 +37,7 @@ from mltau.tools.evaluation.decode_ParTauDETR import (
     tau_scores,
 )
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
+from mltau.tools.evaluation import set_to_set_models as s2s_eval
 
 PT_BINS = ((15, 25), (25, 35), (35, 50), (40, 45))
 ROC_EFFICIENCIES = (0.5, 0.6, 0.7, 0.8, 0.9, 0.95)
@@ -54,13 +55,6 @@ def iqr_resolution(response: np.ndarray) -> dict:
         "iqr_over_med": float((q75 - q25) / q50) if q50 else float("nan"),
         "n": int(response.size),
     }
-
-
-def decay_mode_index(n_charged: np.ndarray, n_neutral: np.ndarray) -> np.ndarray:
-    """Same (n_charged, n_neutral) -> mode convention as the parent losses:
-    5 * (n_charged - 1) + n_neutral; n_charged == 0 -> -1 (unphysical)."""
-    mode = 5 * (n_charged - 1) + n_neutral
-    return np.where(n_charged > 0, mode, -1)
 
 
 def to_device(batch, device):
@@ -187,7 +181,7 @@ def tau_id_metrics(sig_scores: np.ndarray, bkg_scores: np.ndarray) -> dict:
     }
 
 
-def reconstruction_metrics(sig, threshold: float, mass_from_class: bool) -> dict:
+def reconstruction_metrics(sig, threshold: float, mass_from_class: bool, tau_daughter_pdg_ids) -> dict:
     """Object- and daughter-level reconstruction on the genuine tau jets."""
     keep = torch.as_tensor(sig["is_tau"])
     outputs = {k: v[keep] for k, v in sig["outputs"].items()}
@@ -196,7 +190,8 @@ def reconstruction_metrics(sig, threshold: float, mass_from_class: bool) -> dict
 
     true_p4, true_charge, true_meson_class = get_true_particles(targets, reco_jet_p4s)
     pred_p4, pred_charge, pred_meson_class = get_predicted_particles(
-        outputs, reco_jet_p4s, obj_cls_trsh=threshold, mass_from_class=mass_from_class
+        outputs, reco_jet_p4s, obj_cls_trsh=threshold, mass_from_class=mass_from_class,
+        tau_daughter_pdg_ids=tau_daughter_pdg_ids,
     )
 
     # ---- object level: visible tau from summed daughters ----
@@ -224,19 +219,24 @@ def reconstruction_metrics(sig, threshold: float, mass_from_class: bool) -> dict
     dr = np.sqrt(deta**2 + dphi**2)[both]
     results["dR_median"] = float(np.median(dr)) if dr.size else float("nan")
 
-    # ---- decay mode from daughter counts ----
-    pred_ch = ak.to_numpy(ak.sum(pred_meson_class == 0, axis=1))
-    pred_ne = ak.to_numpy(ak.sum(pred_meson_class == 1, axis=1))
-    true_ch = ak.to_numpy(ak.sum(true_meson_class == 0, axis=1))
-    true_ne = ak.to_numpy(ak.sum(true_meson_class == 1, axis=1))
-    pred_mode = decay_mode_index(pred_ch, pred_ne)
-    true_mode = decay_mode_index(true_ch, true_ne)
-    valid = true_mode >= 0
+    pred_pdg = s2s_eval.meson_class_to_pdg(pred_meson_class, tau_daughter_pdg_ids)
+    true_pdg = s2s_eval.meson_class_to_pdg(true_meson_class, tau_daughter_pdg_ids)
+    pred_ch = ak.to_numpy(ak.sum(pred_pdg == s2s_eval.CHARGED_HADRON_PDG, axis=1))
+    pred_mode = ak.to_numpy(s2s_eval.get_decay_mode(pred_pdg))
+    true_mode = ak.to_numpy(s2s_eval.get_decay_mode(true_pdg))
+    valid = has_true
     results["decay_mode_accuracy"] = float((pred_mode[valid] == true_mode[valid]).mean())
     results["decay_mode_unphysical_frac"] = float(
-        ((pred_mode[valid] < 0) | (pred_ch[valid] % 2 == 0)).mean()
+        (
+            (pred_mode[valid] == s2s_eval.RARE_DECAY_MODE_EXT)
+            | ((pred_ch[valid] > 0) & (pred_ch[valid] % 2 == 0))
+        ).mean()
     )
-    main_modes = [0, 1, 2, 10, 11]  # h, h+pi0, h+2pi0, 3h, 3h+pi0
+    main_modes = [0, 1, 2, 10, 11, s2s_eval.ELECTRON_DECAY_MODE, s2s_eval.MUON_DECAY_MODE]
+    results["decay_mode_labels"] = {
+        str(s2s_eval.ELECTRON_DECAY_MODE): "electron",
+        str(s2s_eval.MUON_DECAY_MODE): "muon",
+    }
     confusion = {}
     for tm in main_modes:
         sel = true_mode == tm
@@ -360,7 +360,9 @@ def main():
         "mass_from_class": mass_from_class,
         "signal_files": [os.path.basename(f) for f in sig_files],
         "n_signal_jets": sig["n_jets"],
-        "reconstruction": reconstruction_metrics(sig, threshold, mass_from_class),
+        "reconstruction": reconstruction_metrics(
+            sig, threshold, mass_from_class, cfg.dataset.tau_daughter_pdg_ids
+        ),
     }
 
     if args.background_files >= 0 and sig["tau_score"] is not None:
