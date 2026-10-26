@@ -52,6 +52,10 @@ logging:
         workspace: null
 
 model:
+    # Optional checkpoint path: reuse compatible network weights, but reset the
+    # ID output layer for multiclass training. Optimizer, scheduler and threshold
+    # calibration start fresh; this is not a resume. null trains from scratch.
+    warm_start_checkpoint: null
     # Always equal to dataset.max_tau_daughters, by interpolation. The matcher
     # hands out min(num_queries, n_targets) pairs, so with fewer queries than
     # target slots the surplus targets are unreachable and never supervised,

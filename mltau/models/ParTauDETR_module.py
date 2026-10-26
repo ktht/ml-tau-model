@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
-from mltau.models.ParTauDETR import ParTauDETR
+from mltau.models.ParTauDETR import ParTauDETR, TAU_ID_CLASS_NAMES
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
@@ -380,21 +380,22 @@ class SetCriterion(nn.Module):
 
     Division of labour, fixed by design:
 
-    - Whether a jet is a tau at all is decided by the tauID head ONLY. It is the
-      one term background jets contribute to, and the one term `jet_weights`
+    - The tauID head distinguishes background, hadronic taus, tau electrons and
+      tau muons. It is the only term leptonic/background jets contribute to,
+      and the one term `jet_weights`
       (cls_weight) applies to: that weight matches the (theta, p) spectra of
       signal and background so the tagger cannot key on pt and theta, and it
       has no other purpose.
     - Objectness answers "which queries are real daughters of this tau", and
       together with kinematics, charge, meson class and the parent constraints
-      it is trained on signal jets only and UNWEIGHTED. Reweighting the
+      it is trained on hadronic tau jets only and UNWEIGHTED. Reweighting the
       reconstruction would reshape the pt spectrum the regression and
       classification heads are optimised on without decorrelating anything;
       the first model trained them unweighted (its production had no
       cls_weight column) and that is the behaviour kept.
-    - Background jets are deliberately NOT pushed towards "no object": on a
-      background jet objectness is untrained and its scores are meaningless, so
-      inference and evaluation gate the daughter set with the tauID score.
+    - Leptonic/background jets are deliberately NOT pushed towards "no object":
+      their objectness is untrained, so inference and evaluation gate the
+      daughter set with the hadronic tau probability.
     """
 
     def __init__(
@@ -844,6 +845,7 @@ class SetCriterion(nn.Module):
         target_is_tau: torch.Tensor | None = None,
         jet_weights: torch.Tensor | None = None,
         objectness_threshold: torch.Tensor | float = 0.5,
+        target_tau_id: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         pred_logits = outputs["pred_logits"]
         pred_kinematics = outputs["pred_kinematics"]
@@ -853,10 +855,9 @@ class SetCriterion(nn.Module):
         batch_size, num_queries, _ = pred_logits.shape
         device = pred_logits.device
 
-        # Daughter-level losses are signal-only: background jets only supervise
-        # the tau-tagging head (loss_tau_id). If no tau label is provided we treat
-        # every jet as signal to preserve the previous behaviour.
-        if target_is_tau is not None:
+        if target_tau_id is not None:
+            signal_mask = target_tau_id == 1
+        elif target_is_tau is not None:
             signal_mask = target_is_tau.bool()
         else:
             signal_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
@@ -890,15 +891,17 @@ class SetCriterion(nn.Module):
         # layer's before any aux-layer re-matching overwrites them.
         final_cost_terms = dict(self.matcher.last_cost_terms)
 
-        # jet-level tau-tagging loss: the ONLY term that sees cls_weight, and the
-        # only one background jets contribute to.
-        if "is_tau" in outputs and target_is_tau is not None:
+        if "is_tau" in outputs:
+            if target_tau_id is None:
+                raise ValueError("The multiclass tau ID head requires a tau_id target.")
+            if target_tau_id.shape != (batch_size,):
+                raise ValueError(f"Expected tau_id shape [{batch_size}].")
             if jet_weights is not None:
                 tau_w = jet_weights.to(dtype=pred_logits.dtype, device=device)
             else:
                 tau_w = pred_logits.new_ones(batch_size)
             loss_tau_id = self.tau_loss.compute_tagging_loss(
-                outputs["is_tau"], target_is_tau, tau_w
+                outputs["is_tau"], target_tau_id, tau_w
             )
         else:
             loss_tau_id = pred_logits.new_zeros(())
@@ -1617,10 +1620,9 @@ class ParTauDETRModule(L.LightningModule):
             ~target_mask, self.ignore_index
         )
 
-        # Jet-level tau-tagging label. Prefer an explicit `is_tau` target when the
-        # dataloader provides it; otherwise fall back to "has at least one valid
-        # daughter", which is the same signal/background distinction.
-        if "is_tau" in targets:
+        if "tau_id" in targets:
+            target_is_tau = (targets["tau_id"] == 1).long()
+        elif "is_tau" in targets:
             target_is_tau = targets["is_tau"].long()
         else:
             target_is_tau = target_mask.any(dim=1).long()
@@ -1656,6 +1658,7 @@ class ParTauDETRModule(L.LightningModule):
 
     def training_step(self, batch, _batch_idx):
         outputs, targets, weights, gen_jet_tau_p4, kinematics_reference_p4 = self.forward(batch)
+        self._log_tau_id_metrics(outputs, targets, weights, "train")
         (
             target_kinematics,
             target_charge_cls,
@@ -1677,6 +1680,7 @@ class ParTauDETRModule(L.LightningModule):
             target_parent_p4=gen_jet_tau_p4,
             kinematics_reference_p4=kinematics_reference_p4,
             target_is_tau=target_is_tau,
+            target_tau_id=targets.get("tau_id"),
             jet_weights=weights,
             objectness_threshold=self.score_threshold_calibrated,
         )
@@ -2055,8 +2059,43 @@ class ParTauDETRModule(L.LightningModule):
         self.val_jets.reset()
         self.validation_threshold_buffer.reset()
 
+    def _log_tau_id_metrics(self, outputs, targets, weights, stage: str) -> None:
+        if "is_tau" not in outputs:
+            return
+        labels = targets["tau_id"].long()
+        predictions = outputs["is_tau"].detach().argmax(dim=-1)
+        num_classes = len(TAU_ID_CLASS_NAMES)
+        counts = torch.bincount(labels, minlength=num_classes)
+        weight_sums = torch.bincount(
+            labels, weights=weights.detach().float(), minlength=num_classes
+        )
+        self.log(
+            f"{stage}_tau_id/accuracy", (predictions == labels).float().mean(),
+            on_step=False, on_epoch=True, batch_size=labels.numel(), sync_dist=True,
+        )
+        for class_index, class_name in enumerate(TAU_ID_CLASS_NAMES):
+            for metric, values in (("count", counts), ("weight_sum", weight_sums)):
+                self.log(
+                    f"{stage}_tau_id/{class_name}/{metric}", values[class_index].float(),
+                    on_step=False, on_epoch=True, reduce_fx="sum", sync_dist=True,
+                    batch_size=labels.numel(),
+                )
+        if stage == "val":
+            confusion = torch.bincount(
+                labels * num_classes + predictions, minlength=num_classes**2
+            ).reshape(num_classes, num_classes)
+            for truth_index, truth_name in enumerate(TAU_ID_CLASS_NAMES):
+                for pred_index, pred_name in enumerate(TAU_ID_CLASS_NAMES):
+                    self.log(
+                        f"val_tau_id/confusion/{truth_name}/{pred_name}",
+                        confusion[truth_index, pred_index].float(),
+                        on_step=False, on_epoch=True, reduce_fx="sum", sync_dist=True,
+                        batch_size=labels.numel(),
+                    )
+
     def validation_step(self, batch, _batch_idx):
         outputs, targets, weights, gen_jet_tau_p4, kinematics_reference_p4 = self.forward(batch)
+        self._log_tau_id_metrics(outputs, targets, weights, "val")
         (
             target_kinematics,
             target_charge_cls,
@@ -2078,6 +2117,7 @@ class ParTauDETRModule(L.LightningModule):
             target_parent_p4=gen_jet_tau_p4,
             kinematics_reference_p4=kinematics_reference_p4,
             target_is_tau=target_is_tau,
+            target_tau_id=targets.get("tau_id"),
             jet_weights=weights,
             objectness_threshold=self.score_threshold_calibrated,
         )
@@ -2385,12 +2425,11 @@ class ParTauDETRModule(L.LightningModule):
 
         if "is_tau" in outputs:
             result["is_tau_logits"] = outputs["is_tau"]
-            result["is_tau"] = torch.softmax(outputs["is_tau"], dim=-1)[..., 1]
-            # Whether the jet is a tau at all is the tauID head's decision, not
-            # objectness's (see SetCriterion): on a background jet the
-            # objectness scores are untrained. pred_mask is the gated set that
-            # downstream code should use; the raw objectness selection is kept
-            # alongside for studies on true tau jets.
+            probabilities = torch.softmax(outputs["is_tau"].float(), dim=-1)
+            result["tau_id_probs"] = probabilities
+            result["is_tau"] = probabilities[..., 1]
+            result["is_tau_electron"] = probabilities[..., 2]
+            result["is_tau_muon"] = probabilities[..., 3]
             result["pred_mask_objectness"] = pred_mask
             tagged = result["is_tau"] >= self.tau_id_threshold
             result["pred_mask"] = pred_mask & tagged[:, None]

@@ -6,6 +6,8 @@ from torch import nn
 
 from mltau.models.ParticleTransformer import ParticleTransformer
 
+TAU_ID_CLASS_NAMES = ("background", "hadronic_tau", "tau_electron", "tau_muon")
+
 
 def decode_kinematics(
     kinematics: torch.Tensor,
@@ -94,7 +96,7 @@ class ParTauDETR(ParticleTransformer):
       - pred_meson_class_logits: configured meson classification logits
 
     Jet-level head:
-      - is_tau: binary tau-tagging logits from the pooled global token.
+      - is_tau: logits ordered as background, hadronic tau, tau electron, tau muon.
     """
 
     def __init__(
@@ -203,16 +205,13 @@ class ParTauDETR(ParticleTransformer):
         self.charge_head = nn.Linear(embed_dim, num_charge_classes)
         self.meson_class_head = nn.Linear(embed_dim, num_meson_classes)
 
-        # Jet-level tau-tagging head. The global (cls) token already pools the
-        # whole jet, so a small MLP on top of it is all that is needed for the
-        # binary signal-vs-background classification.
         if tau_id_head:
             head_hidden = embed_dim // 2
             self.tau_head = nn.Sequential(
                 nn.Linear(embed_dim, head_hidden),
                 nn.GELU() if activation == "gelu" else nn.ReLU(),
                 nn.Dropout(head_dropout / 2),
-                nn.Linear(head_hidden, 2),
+                nn.Linear(head_hidden, len(TAU_ID_CLASS_NAMES)),
             )
         else:
             self.tau_head = None

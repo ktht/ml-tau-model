@@ -141,11 +141,17 @@ def _predicted_components(outputs, reco_jet_p4s, mass_from_class: bool = False):
     return pred_scores, pred_p4, pred_charge, pred_meson_class
 
 
-def tau_scores(outputs):
-    """p(tau) per jet from the tauID head, or None if the model has no head."""
+def tau_id_probabilities(outputs):
+    """Probabilities ordered as background, hadronic tau, tau electron, tau muon."""
     if "is_tau" not in outputs:
         return None
-    return torch.softmax(outputs["is_tau"].float(), dim=-1)[..., 1]
+    return torch.softmax(outputs["is_tau"].float(), dim=-1)
+
+
+def tau_scores(outputs):
+    """p(hadronic tau) per jet, or None if the model has no ID head."""
+    probabilities = tau_id_probabilities(outputs)
+    return None if probabilities is None else probabilities[..., 1]
 
 
 def get_predicted_particles(

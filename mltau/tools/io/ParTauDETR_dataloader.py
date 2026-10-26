@@ -33,6 +33,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
           [log(pt_dau/pt_jet), delta_eta(dau-jet), sin(delta_phi), cos(delta_phi), log(m_dau/m_jet)]
       - particles_charge_ohe: [N, T, 3] one-hot for charges [-1, 0, +1]
       - particles_meson_class_ohe: [N, T, C] one-hot over configured meson classes
+      - tau_id: [N], 0=background, 1=hadronic tau, 2=tau electron, 3=tau muon
+      - is_tau: [N], true only for hadronic taus (reconstruction supervision)
 
     where T = cfg.dataset.max_tau_daughters if provided, otherwise inferred from
     the currently loaded row-group.
@@ -305,6 +307,15 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         daughter_p4 = data.gen_jet_tau_vis_daughter_p4s
         daughter_charge_jag = data.gen_jet_tau_vis_daughter_charges
 
+        electron_count = ak.to_numpy(ak.sum(abs(daughter_pdg_jag) == 11, axis=-1))
+        muon_count = ak.to_numpy(ak.sum(abs(daughter_pdg_jag) == 13, axis=-1))
+        if np.any(electron_count + muon_count > 1):
+            raise ValueError("Expected at most one electron or muon among truth tau daughters.")
+        tau_id = (ak.to_numpy(data.gen_jet_tau_decaymode) != -1).astype(np.int64)
+        tau_id[electron_count == 1] = 2
+        tau_id[muon_count == 1] = 3
+        is_hadronic_tau = tau_id == 1
+
         daughter_pt_cut = float(self.cfg.dataset.get("tau_daughter_pt_cut", -1.0))
         if daughter_pt_cut >= 0.0 and len(daughter_p4.fields) > 0:
             daughter_pt = self._get_record_field(daughter_p4, ["pt", "rho"])
@@ -320,6 +331,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         supported_pdg = daughter_pdg_abs == supported_ids[0]
         for pdg_id in supported_ids[1:]:
             supported_pdg = supported_pdg | (daughter_pdg_abs == pdg_id)
+
+        supported_pdg = supported_pdg & is_hadronic_tau[:, None]
 
         daughter_p4 = daughter_p4[supported_pdg]
         daughter_pdg_jag = daughter_pdg_jag[supported_pdg]
@@ -484,11 +497,8 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
             "particles_kinematics": torch.from_numpy(daughter_kinematics_np).float(),
             "particles_charge_ohe": torch.from_numpy(charge_ohe).float(),
             "particles_meson_class_ohe": torch.from_numpy(meson_class_ohe).float(),
-            # Jet-level tau-tagging label, following ParticleTransformerDataset:
-            # -1 -> no genuine tau (background), >= 0 -> genuine tau (signal).
-            "is_tau": torch.from_numpy(
-                (ak.to_numpy(data.gen_jet_tau_decaymode) != -1).astype(np.int64)
-            ),
+            "tau_id": torch.from_numpy(tau_id),
+            "is_tau": torch.from_numpy(is_hadronic_tau.astype(np.int64)),
             "gen_jet_tau_charge": torch.from_numpy(
                 ak.to_numpy(data.gen_jet_tau_charge).astype(np.int64)
             ),
@@ -544,9 +554,6 @@ class ParTauDETRDataModule(ParTDataModule):
 
     def __init__(self, cfg: DictConfig, debug_run: bool = False):
         super().__init__(cfg=cfg, debug_run=debug_run)
-        # Tau tagging is a binary signal-vs-background task, so we need the
-        # background samples in addition to the signal samples. The base class
-        # otherwise defaults to signal-only (`sample = "z"`) for set-to-set.
         if cfg.model.detr.tau_id_head:
             self.sample = "*"
 

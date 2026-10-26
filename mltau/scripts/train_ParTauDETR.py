@@ -553,6 +553,30 @@ def check_output_dir(cfg: DictConfig) -> str:
     return output_dir
 
 
+def warm_start_model(model: ParTauDETR_module.ParTauDETRModule, checkpoint_path: str) -> None:
+    """Load compatible network weights, retaining the fresh multiclass output layer."""
+    if model.ParTauDETR.tau_head is None:
+        raise ValueError("Multiclass warm start requires model.detr.tau_id_head=true.")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    prefix = "ParTauDETR."
+    network_state = {
+        name.removeprefix(prefix): value
+        for name, value in checkpoint["state_dict"].items()
+        if name.startswith(prefix)
+    }
+    fresh_state = model.ParTauDETR.state_dict()
+    for name in ("tau_head.3.weight", "tau_head.3.bias"):
+        if name not in network_state:
+            raise ValueError(f"Warm-start checkpoint is missing {prefix}{name}.")
+        network_state[name] = fresh_state[name]
+    model.ParTauDETR.load_state_dict(network_state, strict=True)
+    print(
+        f"[ParTauDETR] warm start from {checkpoint_path}: ID output layer reset; "
+        "optimizer, scheduler and threshold calibration start fresh.",
+        flush=True,
+    )
+
+
 @hydra.main(config_path="../config", config_name="main_ParTauDETR", version_base=None)
 def train(cfg: DictConfig):
     # `kill -USR1 <pid>` dumps the Python stack of every thread to stderr without
@@ -585,6 +609,11 @@ def train(cfg: DictConfig):
 
 
     model = ParTauDETR_module.ParTauDETRModule(cfg=cfg)
+    warm_start_checkpoint = cfg.model.get("warm_start_checkpoint", None)
+    if warm_start_checkpoint:
+        warm_start_model(
+            model, os.path.expanduser(os.path.expandvars(str(warm_start_checkpoint)))
+        )
 
     check_output_dir(cfg)
 

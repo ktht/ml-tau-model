@@ -32,6 +32,61 @@ Four task-specific CLS tokens independently attend to the shared backbone output
   - Kinematics: Combined loss using `HuberLoss(δ=1.0)` for $p_T$, $\eta$, and $m$, plus a chord loss (L2 distance) for the $(\sin\phi, \cos\phi)$ vector. The mass component is weighted by $\lambda_m = 0.2$.
 - **Conditional gating**: Auxiliary losses (charge, decay mode, kinematics) are multiplied by the truth tau label, so only signal jets contribute to those tasks.
 
+### ParTauDETR Multiclass ID
+
+ParTauDETR uses a four-class softmax on the pooled global token, independently
+of its hadronic daughter decoder. The fixed class order is:
+
+| Index | Class | Prediction field |
+|-------|-------|------------------|
+| 0 | Background | `tau_id_probs[..., 0]` |
+| 1 | Hadronic tau | `is_tau` |
+| 2 | Electron from tau decay | `is_tau_electron` |
+| 3 | Muon from tau decay | `is_tau_muon` |
+
+`forward()` returns four raw logits in `outputs["is_tau"]`. `predict_step()`
+returns the named probabilities above, all four probabilities in `tau_id_probs`,
+and the raw logits in `is_tau_logits`. The three tau probabilities are not
+renormalized: their remainder is the background probability. The decoding helper
+`tau_id_probabilities(outputs)` returns the full softmax; `tau_scores(outputs)`
+continues to return only the hadronic tau probability.
+
+Truth `tau_id` is derived from `gen_jet_tau_vis_daughter_pdgs` before daughter
+momentum cuts, meson filtering, sorting or truncation. Exactly one absolute PDG
+ID 11 or 13 identifies a tau electron or tau muon; multiple electrons/muons in
+that tau-specific truth collection are rejected. Without a lepton, the existing
+`gen_jet_tau_decaymode != -1` label identifies a hadronic tau. Reconstructed jet
+constituent PDGs are not used to label tau ancestry.
+
+The dataset's `is_tau` target means **hadronic tau**, not any tau decay. Leptonic
+and background jets have no active daughter targets and contribute only to
+weighted, label-smoothed ID cross-entropy. Matching, objectness, daughter losses,
+intermediate decoder losses and all parent penalties are hadronic-only and
+unweighted. The shared encoder still receives ID gradients from every class.
+Inference gates the daughter set using `is_tau >= model.detr.inference.tau_id_threshold`.
+
+Training and validation log `train_tau_id/*` and `val_tau_id/*` class counts,
+summed `cls_weight` and accuracy; validation also logs confusion counts (truth
+class first). The evaluation script reports `tau_id_multiclass` with the class
+order, truth-row confusion matrix and per-class one-vs-rest/background ROC
+metrics. `tau_id` remains hadronic-vs-background; `tau_id_vs_rest` also includes
+leptonic taus among negatives. Absent classes produce null AUC and empty curves.
+Reconstruction evaluation remains restricted to hadronic taus.
+
+Training parquet files must retain leptonic taus and their original truth
+daughters. Check class counts and weight sums before relying on leptonic scores;
+zero counts or zero effective weights cannot train those classes. Existing
+`cls_weight` values are preserved, not automatically rebalanced by decay class.
+
+Binary checkpoints cannot be resumed or evaluated directly with the enlarged
+head. For a fresh multiclass training run, use
+`model.warm_start_checkpoint=/path/to/binary.ckpt`. This loads compatible network
+weights with strict shape/key checking except for the reset ID output layer;
+optimizer, scheduler, criterion buffers and objectness-threshold calibration
+start fresh. Use matching architecture, input features and scaler settings.
+Only load trusted checkpoints. The option also resets the ID output layer when
+given a multiclass checkpoint; leave it null for ordinary training from scratch.
+
 ## Input Features
 
 17 features per candidate particle:
