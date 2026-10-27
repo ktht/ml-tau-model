@@ -32,60 +32,87 @@ Four task-specific CLS tokens independently attend to the shared backbone output
   - Kinematics: Combined loss using `HuberLoss(δ=1.0)` for $p_T$, $\eta$, and $m$, plus a chord loss (L2 distance) for the $(\sin\phi, \cos\phi)$ vector. The mass component is weighted by $\lambda_m = 0.2$.
 - **Conditional gating**: Auxiliary losses (charge, decay mode, kinematics) are multiplied by the truth tau label, so only signal jets contribute to those tasks.
 
-### ParTauDETR Multiclass ID
+### ParTauDETR Hybrid Reconstruction
 
-ParTauDETR uses a four-class softmax on the pooled global token, independently
-of its hadronic daughter decoder. The fixed class order is:
+The shared encoder feeds a five-class ID head, two direct visible-tau heads,
+and the DETR daughter decoder. Class indices are defined in `mltau/tools/tau_id.py`:
 
-| Index | Class | Prediction field |
-|-------|-------|------------------|
-| 0 | Background | `tau_id_probs[..., 0]` |
-| 1 | Hadronic tau | `is_tau` |
-| 2 | Electron from tau decay | `is_tau_electron` |
-| 3 | Muon from tau decay | `is_tau_muon` |
+| Index | Class | Prediction probability | Reconstruction supervision |
+|-------|-------|------------------------|----------------------------|
+| 0 | Background | `tau_id_probs[..., 0]` | None |
+| 1 | Hadronic DM 0 | `is_tau_dm0` | Direct charge and kinematics |
+| 2 | Other hadronic tau | `is_tau_other` | DETR and all its auxiliary losses |
+| 3 | Electron from tau decay | `is_tau_electron` | Direct charge and kinematics |
+| 4 | Muon from tau decay | `is_tau_muon` | Direct charge and kinematics |
 
-`forward()` returns four raw logits in `outputs["is_tau"]`. `predict_step()`
-returns the named probabilities above, all four probabilities in `tau_id_probs`,
-and the raw logits in `is_tau_logits`. The three tau probabilities are not
-renormalized: their remainder is the background probability. The decoding helper
-`tau_id_probabilities(outputs)` returns the full softmax; `tau_scores(outputs)`
-continues to return only the hadronic tau probability.
+DM 0 is specifically the stored decay mode 0, not all one-prong decays. Truth
+classification examines original `gen_jet_tau_vis_daughter_pdgs` before cuts,
+meson filtering or truncation. Exactly one absolute PDG ID 11 or 13 takes
+precedence over decay mode; multiple truth electrons/muons are rejected.
+Without a lepton, decay mode -1 means background, 0 means DM0, and other modes
+mean other hadronic. Reconstructed constituent PDGs do not label ancestry.
 
-Truth `tau_id` is derived from `gen_jet_tau_vis_daughter_pdgs` before daughter
-momentum cuts, meson filtering, sorting or truncation. Exactly one absolute PDG
-ID 11 or 13 identifies a tau electron or tau muon; multiple electrons/muons in
-that tau-specific truth collection are rejected. Without a lepton, the existing
-`gen_jet_tau_decaymode != -1` label identifies a hadronic tau. Reconstructed jet
-constituent PDGs are not used to label tau ancestry.
+`is_tau` remains the union of the two hadronic classes. The dataset separately
+provides `is_detr_tau`, `is_direct_tau`, and `direct_kinematics`. The direct
+targets use the full stored visible tau four-momentum and charge, not filtered
+daughters or neutrinos. Both branches run on every input; truth classes alone
+select losses. Background contributes only ID loss. `cls_weight` applies only
+to ID; reconstruction losses average unweighted over each eligible subset.
+All DETR losses, matching, parent constraints, daughter metrics and objectness
+threshold calibration exclude DM0 and leptonic taus.
 
-The dataset's `is_tau` target means **hadronic tau**, not any tau decay. Leptonic
-and background jets have no active daughter targets and contribute only to
-weighted, label-smoothed ID cross-entropy. Matching, objectness, daughter losses,
-intermediate decoder losses and all parent penalties are hadronic-only and
-unweighted. The shared encoder still receives ID gradients from every class.
-Inference gates the daughter set using `is_tau >= model.detr.inference.tau_id_threshold`.
+The direct heads use separate learned CLS tokens with shared pooling blocks.
+Charge is a positive-charge logit trained with BCE. Kinematics uses MultiParTau's
+five-component basis: log relative pt, delta eta, sin/cos delta phi, log relative
+mass, with its Huber/chord loss. `model.direct_tau_loss` holds independent scales
+and component weights; null scales use the unscaled loss and must be measured
+for these tau-level targets before enabling residual normalization. Direct mass
+regression stays enabled independently of the daughter's mass configuration.
+Overall direct loss weights are `model.detr.loss.weight_direct_charge` and
+`weight_direct_kinematics`.
 
-Training and validation log `train_tau_id/*` and `val_tau_id/*` class counts,
-summed `cls_weight` and accuracy; validation also logs confusion counts (truth
-class first). The evaluation script reports `tau_id_multiclass` with the class
-order, truth-row confusion matrix and per-class one-vs-rest/background ROC
-metrics. `tau_id` remains hadronic-vs-background; `tau_id_vs_rest` also includes
-leptonic taus among negatives. Absent classes produce null AUC and empty curves.
-Reconstruction evaluation remains restricted to hadronic taus.
+`forward()` returns five raw ID logits in `is_tau`, plus `direct_charge_logits`
+and `direct_kinematics`. `predict_step()`/`decode_predictions()` return all five
+probabilities in `tau_id_probs`, with `is_tau = is_tau_dm0 + is_tau_other`.
+The decoding helper `tau_scores(outputs)` also returns this total hadronic score.
+These probabilities are not renormalized to remove background.
 
-Training parquet files must retain leptonic taus and their original truth
-daughters. Check class counts and weight sums before relying on leptonic scores;
-zero counts or zero effective weights cannot train those classes. Existing
-`cls_weight` values are preserved, not automatically rebalanced by decay class.
+Prediction selects the five-way argmax (`predicted_tau_class`). An optional
+`model.detr.inference.routing_score_threshold` cuts on the winning probability;
+the default 0 adds no confidence cut. Background is always rejected. The old
+`tau_id_threshold` is a separate hadronic-tagging operating point, not a routing
+cut. `pred_mask` contains daughters only for accepted other-hadronic predictions;
+`pred_mask_objectness` retains the ungated objectness selection.
 
-Binary checkpoints cannot be resumed or evaluated directly with the enlarged
-head. For a fresh multiclass training run, use
-`model.warm_start_checkpoint=/path/to/binary.ckpt`. This loads compatible network
-weights with strict shape/key checking except for the reset ID output layer;
-optimizer, scheduler, criterion buffers and objectness-threshold calibration
-start fresh. Use matching architecture, input features and scaler settings.
-Only load trusted checkpoints. The option also resets the ID output layer when
-given a multiclass checkpoint; leave it null for ordinary training from scratch.
+Both branches are exposed as `direct_p4`, `direct_charge`, `detr_p4`, `detr_charge`
+and `detr_valid`. Unified `tau_p4` uses Cartesian `[px, py, pz, E]`; `tau_charge`
+is an integer and `reconstruction_valid` must be checked. Rejected events,
+non-finite predictions and DETR routes with no selected daughters are invalid;
+their unified outputs are zeroed. `route_accepted` separates ID acceptance from
+successful reconstruction. No artificial daughters are made for direct routes.
+
+Validation logs five-class counts, weight sums and confusion under `*_tau_id/*`.
+`val_jet/*` describes the DETR subset; `val_reconstruction/{truth,predicted}/*`
+reports per-class reconstruction efficiency, charge accuracy over all truth
+events, and pt relative error on valid reconstructions. Offline evaluation adds
+`routed_reconstruction` for both routing modes on identical truth-class cohorts,
+including rejected/invalid counts, charge accuracy, pt/energy response, angular
+and mass residuals. Background reconstruction efficiency is a false-acceptance
+diagnostic, not a reconstruction-quality measure. Truth routing is diagnostic
+only and does not apply the ID confidence cut. ID ROC metrics retain total
+hadronic-vs-background (`tau_id`) and hadronic-vs-rest (`tau_id_vs_rest`) alongside
+the five-class metrics. `--routing-score-threshold` overrides the inference cut.
+
+Training data must retain leptonic tau examples and their original daughters.
+Check class counts and effective ID weights; existing weights are not rebalanced.
+Binary/four-class checkpoints cannot be resumed or evaluated directly. Use
+`model.warm_start_checkpoint=/path/to/model.ckpt` to load compatible network
+weights, reset ID output, and initialize direct tokens/heads if entirely absent.
+Existing complete direct heads are loaded; partially missing heads or other
+unexpected key/shape mismatches fail. Optimizer, scheduler, criterion and threshold
+calibration start fresh. Match input features/scaler/architecture and load only
+trusted checkpoints. Null trains from scratch; warm start also resets the ID
+output when given a five-class checkpoint.
 
 ## Input Features
 

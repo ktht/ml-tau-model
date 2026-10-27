@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 
 from mltau.models.ParTauDETR import ParTauDETR, TAU_ID_CLASS_NAMES
+from mltau.tools.tau_id import TauID
 from mltau.tools.io.general import BatchInputs
 from mltau.tools.logging import set_to_set as s2s
 from mltau.tools.losses import TauLoss
@@ -380,22 +381,21 @@ class SetCriterion(nn.Module):
 
     Division of labour, fixed by design:
 
-    - The tauID head distinguishes background, hadronic taus, tau electrons and
-      tau muons. It is the only term leptonic/background jets contribute to,
-      and the one term `jet_weights`
+    - The tauID head distinguishes background, DM0, other hadronic taus, tau
+      electrons and tau muons. All jets train ID; only ID uses `jet_weights`
       (cls_weight) applies to: that weight matches the (theta, p) spectra of
       signal and background so the tagger cannot key on pt and theta, and it
       has no other purpose.
     - Objectness answers "which queries are real daughters of this tau", and
       together with kinematics, charge, meson class and the parent constraints
-      it is trained on hadronic tau jets only and UNWEIGHTED. Reweighting the
-      reconstruction would reshape the pt spectrum the regression and
+      it is trained on non-DM0 hadronic tau jets only and UNWEIGHTED. Reweighting
+      the reconstruction would reshape the pt spectrum the regression and
       classification heads are optimised on without decorrelating anything;
       the first model trained them unweighted (its production had no
       cls_weight column) and that is the behaviour kept.
-    - Leptonic/background jets are deliberately NOT pushed towards "no object":
-      their objectness is untrained, so inference and evaluation gate the
-      daughter set with the hadronic tau probability.
+    - DM0 and leptonic taus train the direct charge and kinematics heads,
+      unweighted. They and background jets never train objectness, including
+      the no-object class. Predicted routing gates the daughter set at inference.
     """
 
     def __init__(
@@ -423,10 +423,16 @@ class SetCriterion(nn.Module):
         object_class_index: int = 0,
         eos_coef: float = 0.1,
         ignore_index: int = -100,
+        direct_tau_loss: TauLoss | None = None,
+        loss_direct_charge_weight: float = 1.0,
+        loss_direct_kinematics_weight: float = 1.0,
     ):
         super().__init__()
         self.matcher = matcher
         self.tau_loss = tau_loss
+        self.direct_tau_loss = direct_tau_loss if direct_tau_loss is not None else TauLoss()
+        self.loss_direct_charge_weight = loss_direct_charge_weight
+        self.loss_direct_kinematics_weight = loss_direct_kinematics_weight
         self.loss_objectness_weight = loss_objectness_weight
         self.loss_tau_id_weight = loss_tau_id_weight
         self.loss_kinematics_weight = loss_kinematics_weight
@@ -846,6 +852,7 @@ class SetCriterion(nn.Module):
         jet_weights: torch.Tensor | None = None,
         objectness_threshold: torch.Tensor | float = 0.5,
         target_tau_id: torch.Tensor | None = None,
+        target_direct_kinematics: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         pred_logits = outputs["pred_logits"]
         pred_kinematics = outputs["pred_kinematics"]
@@ -856,7 +863,7 @@ class SetCriterion(nn.Module):
         device = pred_logits.device
 
         if target_tau_id is not None:
-            signal_mask = target_tau_id == 1
+            signal_mask = target_tau_id == TauID.HADRONIC_OTHER
         elif target_is_tau is not None:
             signal_mask = target_is_tau.bool()
         else:
@@ -913,6 +920,35 @@ class SetCriterion(nn.Module):
             + self.loss_charge_weight * loss_charge
             + self.loss_meson_class_weight * loss_meson_class
         )
+
+        loss_direct_charge = pred_logits.new_zeros(())
+        loss_direct_kinematics = pred_logits.new_zeros(())
+        direct_components = {}
+        if "direct_kinematics" in outputs:
+            if target_tau_id is None or target_direct_kinematics is None:
+                raise ValueError("Direct heads require tau_id and direct_kinematics targets.")
+            direct_mask = (
+                (target_tau_id == TauID.HADRONIC_DM0)
+                | (target_tau_id == TauID.ELECTRON)
+                | (target_tau_id == TauID.MUON)
+            )
+            loss_direct_charge = outputs["direct_charge_logits"].sum() * 0.0
+            loss_direct_kinematics = outputs["direct_kinematics"].sum() * 0.0
+            if direct_mask.any():
+                direct_weights = pred_logits.new_ones(batch_size)[direct_mask]
+                loss_direct_charge = self.direct_tau_loss.compute_charge_loss(
+                    outputs["direct_charge_logits"][direct_mask],
+                    target_parent_charge[direct_mask], direct_weights,
+                )
+                loss_direct_kinematics, direct_components = self.direct_tau_loss.compute_kinematics_loss(
+                    outputs["direct_kinematics"][direct_mask],
+                    target_direct_kinematics[direct_mask], direct_weights,
+                )
+            total_loss = (
+                total_loss
+                + self.loss_direct_charge_weight * loss_direct_charge
+                + self.loss_direct_kinematics_weight * loss_direct_kinematics
+            )
 
         # Deep supervision: the same set losses on every intermediate decoder
         # layer's predictions (model emits aux_outputs only in training mode and
@@ -1254,6 +1290,12 @@ class SetCriterion(nn.Module):
 
         return {
             "loss": total_loss,
+            "loss_direct_charge": loss_direct_charge,
+            "loss_direct_kinematics": loss_direct_kinematics,
+            **{
+                f"direct_kinematics_{name}": direct_components.get(name, pred_logits.new_zeros(()))
+                for name in ("log_pt", "delta_eta", "phi_chord", "log_mass")
+            },
             "loss_objectness": loss_objectness,
             "loss_tau_id": loss_tau_id,
             "loss_kinematics": loss_kinematics,
@@ -1348,6 +1390,11 @@ class ParTauDETRModule(L.LightningModule):
             )
 
         self.tau_loss = TauLoss.from_config(arch.tau_loss, owner="ParTauDETR")
+        if not bool(detr_cfg.tau_id_head):
+            raise ValueError("Hybrid reconstruction requires model.detr.tau_id_head=true.")
+        self.direct_tau_loss = TauLoss.from_config(
+            arch.get("direct_tau_loss", {}), owner="ParTauDETR direct heads"
+        )
         self.num_kinematics_components = int(arch.num_kinematics_components)
 
         embed_dims = [int(d) for d in encoder_cfg.embed_dims]
@@ -1415,6 +1462,9 @@ class ParTauDETRModule(L.LightningModule):
         self.criterion = SetCriterion(
             matcher=self.matcher,
             tau_loss=self.tau_loss,
+            direct_tau_loss=self.direct_tau_loss,
+            loss_direct_charge_weight=float(detr_cfg.loss.get("weight_direct_charge", 1.0)),
+            loss_direct_kinematics_weight=float(detr_cfg.loss.get("weight_direct_kinematics", 1.0)),
             meson_classes=meson_classes,
             # Read strictly: a `.get(key, default)` here would silently fall back
             # to a hidden default if the key were renamed or misspelled.
@@ -1443,10 +1493,10 @@ class ParTauDETRModule(L.LightningModule):
         # Starting value and fallback for the objectness threshold; the
         # calibrated value lives in the `score_threshold_calibrated` buffer.
         self.score_threshold = float(detr_cfg.inference.score_threshold)
-        # p(tau) above which a jet's predicted daughters are kept at prediction
-        # time. Objectness is trained on signal jets only, so the tauID head is
-        # the only thing that can say "this jet has no daughters at all".
         self.tau_id_threshold = float(detr_cfg.inference.get("tau_id_threshold", 0.5))
+        self.routing_score_threshold = float(detr_cfg.inference.get("routing_score_threshold", 0.0))
+        if not 0.0 <= self.routing_score_threshold <= 1.0:
+            raise ValueError("routing_score_threshold must be between 0 and 1.")
 
         # One representative |PDG| per meson class, for the jet-level
         # evaluation: the decay mode is derived by ml-tau-data from PDG ids
@@ -1621,7 +1671,10 @@ class ParTauDETRModule(L.LightningModule):
         )
 
         if "tau_id" in targets:
-            target_is_tau = (targets["tau_id"] == 1).long()
+            target_is_tau = (
+                (targets["tau_id"] == TauID.HADRONIC_DM0)
+                | (targets["tau_id"] == TauID.HADRONIC_OTHER)
+            ).long()
         elif "is_tau" in targets:
             target_is_tau = targets["is_tau"].long()
         else:
@@ -1681,9 +1734,13 @@ class ParTauDETRModule(L.LightningModule):
             kinematics_reference_p4=kinematics_reference_p4,
             target_is_tau=target_is_tau,
             target_tau_id=targets.get("tau_id"),
+            target_direct_kinematics=targets.get("direct_kinematics"),
             jet_weights=weights,
             objectness_threshold=self.score_threshold_calibrated,
         )
+
+        for name in ("loss_direct_charge", "loss_direct_kinematics"):
+            self.log(f"train_losses/{name.removeprefix('loss_')}", losses[name], on_step=False, on_epoch=True)
 
         # A non-finite loss must not reach the optimizer: one backward of a NaN
         # writes NaN into every weight, and the run then continues producing
@@ -1845,7 +1902,7 @@ class ParTauDETRModule(L.LightningModule):
         """
         Stash what the dR matching needs from this training batch.
 
-        Signal jets only. Objectness is trained on signal jets alone -- whether a
+        Non-DM0 hadronic jets only. Objectness is trained on this subset -- whether a
         jet is a tau at all is the tauID head's decision, not objectness's -- so
         on background jets the objectness scores are untrained and arbitrary.
         Letting them into the scan would count every such query above threshold
@@ -1860,10 +1917,7 @@ class ParTauDETRModule(L.LightningModule):
         """
         reco_jet = batch[6]
         target_mask = targets["particles_mask"].bool()
-        if "is_tau" in targets:
-            signal = targets["is_tau"].bool()
-        else:
-            signal = target_mask.any(dim=1)
+        signal = targets["tau_id"] == TauID.HADRONIC_OTHER
         if not bool(signal.any()):
             return
         target_kinematics = targets["particles_kinematics"][signal]
@@ -1998,13 +2052,13 @@ class ParTauDETRModule(L.LightningModule):
         )
         tau_score = None
         if "is_tau" in outputs:
-            tau_score = torch.softmax(outputs["is_tau"].float(), dim=-1)[:, 1]
+            tau_score = torch.softmax(outputs["is_tau"].float(), dim=-1)[:, TauID.HADRONIC_OTHER]
         # The evaluators bin efficiencies against the gen tau and the reco jet,
         # so those travel with the predictions.
         self.val_jets.update(
             pred,
             true,
-            target_is_tau,
+            (targets["tau_id"] == TauID.HADRONIC_OTHER).long(),
             tau_score,
             {
                 "gen_jet_tau_p4s": batch[5],
@@ -2093,6 +2147,43 @@ class ParTauDETRModule(L.LightningModule):
                         batch_size=labels.numel(),
                     )
 
+    @torch.no_grad()
+    def _log_routed_reconstruction(self, outputs, targets, truth_p4, reco_jet_p4):
+        decoded = self.decode_predictions(outputs, reco_jet_p4)
+        truth_classes = targets["tau_id"]
+        truth_charge = targets["gen_jet_tau_charge"]
+        for routing, reconstructed in (
+            ("truth", self.route_reconstruction(decoded, truth_classes)),
+            ("predicted", decoded),
+        ):
+            valid = reconstructed["reconstruction_valid"]
+            pred_pt = reconstructed["tau_p4"][:, :2].square().sum(dim=-1).sqrt()
+            for class_index, class_name in enumerate(TAU_ID_CLASS_NAMES):
+                selected = truth_classes == class_index
+                count = int(selected.sum())
+                if not count:
+                    continue
+                prefix = f"val_reconstruction/{routing}/{class_name}"
+                self.log(
+                    f"{prefix}/efficiency", valid[selected].float().mean(),
+                    batch_size=count, on_step=False, on_epoch=True,
+                )
+                if class_index == TauID.BACKGROUND:
+                    continue
+                correct = valid & (reconstructed["tau_charge"] == truth_charge)
+                self.log(
+                    f"{prefix}/charge_accuracy_all", correct[selected].float().mean(),
+                    batch_size=count, on_step=False, on_epoch=True,
+                )
+                usable = selected & valid & (truth_p4["pt"] > 0)
+                usable_count = int(usable.sum())
+                if usable_count:
+                    relative_error = (pred_pt[usable] / truth_p4["pt"][usable] - 1).abs()
+                    self.log(
+                        f"{prefix}/pt_relative_mae", relative_error.mean(),
+                        batch_size=usable_count, on_step=False, on_epoch=True,
+                    )
+
     def validation_step(self, batch, _batch_idx):
         outputs, targets, weights, gen_jet_tau_p4, kinematics_reference_p4 = self.forward(batch)
         self._log_tau_id_metrics(outputs, targets, weights, "val")
@@ -2118,10 +2209,13 @@ class ParTauDETRModule(L.LightningModule):
             kinematics_reference_p4=kinematics_reference_p4,
             target_is_tau=target_is_tau,
             target_tau_id=targets.get("tau_id"),
+            target_direct_kinematics=targets.get("direct_kinematics"),
             jet_weights=weights,
             objectness_threshold=self.score_threshold_calibrated,
         )
 
+        for name in ("loss_direct_charge", "loss_direct_kinematics"):
+            self.log(f"val_losses/{name.removeprefix('loss_')}", losses[name], on_step=False, on_epoch=True)
         self.log("val_losses/loss", losses["loss"], on_step=False, on_epoch=True)
         self.log(
             "val_losses/objectness",
@@ -2233,6 +2327,7 @@ class ParTauDETRModule(L.LightningModule):
                 self.log(f"val/{key}", value, on_step=False, on_epoch=True)
 
         if not self.trainer.sanity_checking:
+            self._log_routed_reconstruction(outputs, targets, gen_jet_tau_p4, kinematics_reference_p4)
             self._accumulate_jet_level(batch, outputs, targets)
             if self.threshold_scan_enabled:
                 self._buffer_for_threshold_scan(
@@ -2395,9 +2490,8 @@ class ParTauDETRModule(L.LightningModule):
                 "step": int(self.global_step),
             }
 
-    def predict_step(self, batch, _batch_idx):
-        outputs, _, _, _, _ = self.forward(batch)
-
+    def decode_predictions(self, outputs, reco_jet_p4s):
+        """Decode both reconstruction branches and route using predicted ID only."""
         object_scores = torch.softmax(outputs["pred_logits"], dim=-1)[..., 0]
         # The calibrated threshold from the checkpoint, not the static config
         # value: validation reports every val_jet/* number at this operating
@@ -2421,20 +2515,66 @@ class ParTauDETRModule(L.LightningModule):
             "pred_mask": pred_mask,
             "pred_charge": pred_charge,
             "pred_meson_class": meson_class,
+            "direct_charge_logits": outputs["direct_charge_logits"],
+            "direct_kinematics": outputs["direct_kinematics"],
         }
+
+        reference = [reco_jet_p4s[field] for field in ("pt", "eta", "phi", "energy")]
+        result["direct_p4"] = decode_kinematics(
+            outputs["direct_kinematics"].float(), *reference, clamp_log_ratios=True
+        )
+        result["direct_charge_probability"] = outputs["direct_charge_logits"].float().sigmoid()
+        result["direct_charge"] = torch.where(outputs["direct_charge_logits"] >= 0, 1, -1)
+        daughter_p4 = decode_kinematics(
+            outputs["pred_kinematics"].float(), *reference, clamp_log_ratios=True,
+            fixed_mass=(
+                self.criterion.meson_class_mass[meson_class]
+                if self.criterion.mass_from_meson_class else None
+            ),
+        )
+        result["detr_p4"] = daughter_p4.masked_fill(~pred_mask[..., None], 0.0).sum(dim=1)
+        result["detr_charge"] = pred_charge.masked_fill(~pred_mask, 0).sum(dim=1)
+        result["detr_valid"] = pred_mask.any(dim=1)
 
         if "is_tau" in outputs:
             result["is_tau_logits"] = outputs["is_tau"]
             probabilities = torch.softmax(outputs["is_tau"].float(), dim=-1)
             result["tau_id_probs"] = probabilities
-            result["is_tau"] = probabilities[..., 1]
-            result["is_tau_electron"] = probabilities[..., 2]
-            result["is_tau_muon"] = probabilities[..., 3]
+            result["is_tau_dm0"] = probabilities[..., TauID.HADRONIC_DM0]
+            result["is_tau_other"] = probabilities[..., TauID.HADRONIC_OTHER]
+            result["is_tau"] = result["is_tau_dm0"] + result["is_tau_other"]
+            result["is_tau_electron"] = probabilities[..., TauID.ELECTRON]
+            result["is_tau_muon"] = probabilities[..., TauID.MUON]
+            confidence, classes = probabilities.max(dim=-1)
+            accepted = confidence >= self.routing_score_threshold
+            result["predicted_tau_class"] = classes
+            result["route_accepted"] = accepted & (classes != TauID.BACKGROUND)
             result["pred_mask_objectness"] = pred_mask
-            tagged = result["is_tau"] >= self.tau_id_threshold
+            tagged = (classes == TauID.HADRONIC_OTHER) & accepted
             result["pred_mask"] = pred_mask & tagged[:, None]
+            result.update(self.route_reconstruction(result, classes, accepted))
 
         return result
+
+    @staticmethod
+    def route_reconstruction(predictions, classes, accepted=None):
+        """Select a decoded branch; callers may supply truth classes for diagnostics."""
+        use_detr = classes == TauID.HADRONIC_OTHER
+        valid = (classes != TauID.BACKGROUND) & (~use_detr | predictions["detr_valid"])
+        if accepted is not None:
+            valid = valid & accepted
+        tau_p4 = torch.where(use_detr[:, None], predictions["detr_p4"], predictions["direct_p4"])
+        tau_charge = torch.where(use_detr, predictions["detr_charge"], predictions["direct_charge"])
+        valid = valid & torch.isfinite(tau_p4).all(dim=-1)
+        return {
+            "tau_p4": tau_p4.masked_fill(~valid[:, None], 0.0),
+            "tau_charge": tau_charge.masked_fill(~valid, 0),
+            "reconstruction_valid": valid,
+        }
+
+    def predict_step(self, batch, _batch_idx):
+        outputs, _, _, _, reco_jet_p4s = self.forward(batch)
+        return self.decode_predictions(outputs, reco_jet_p4s)
 
     def test_step(self, batch, _batch_idx):
         return self.predict_step(batch, _batch_idx)

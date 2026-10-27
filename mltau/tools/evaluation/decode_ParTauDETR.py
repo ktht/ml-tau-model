@@ -12,6 +12,7 @@ from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.tools.general import reinitialize_p4
 from mltau.tools.io.ParTauDETR_dataloader import ParticleTransformerDETRDataset
 from mltau.models.ParTauDETR import decode_kinematics as decode_kinematics_p4
+from mltau.tools.tau_id import TauID
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -142,7 +143,7 @@ def _predicted_components(outputs, reco_jet_p4s, mass_from_class: bool = False):
 
 
 def tau_id_probabilities(outputs):
-    """Probabilities ordered as background, hadronic tau, tau electron, tau muon."""
+    """Probabilities in TAU_ID_CLASS_NAMES order (five mutually exclusive classes)."""
     if "is_tau" not in outputs:
         return None
     return torch.softmax(outputs["is_tau"].float(), dim=-1)
@@ -151,7 +152,17 @@ def tau_id_probabilities(outputs):
 def tau_scores(outputs):
     """p(hadronic tau) per jet, or None if the model has no ID head."""
     probabilities = tau_id_probabilities(outputs)
-    return None if probabilities is None else probabilities[..., 1]
+    return None if probabilities is None else (
+        probabilities[..., TauID.HADRONIC_DM0] + probabilities[..., TauID.HADRONIC_OTHER]
+    )
+
+
+def detr_tau_scores(outputs):
+    """Other-hadronic probability; daughter decoding applies the routing mask."""
+    probabilities = tau_id_probabilities(outputs)
+    if probabilities is None:
+        return None
+    return probabilities[..., TauID.HADRONIC_OTHER]
 
 
 def get_predicted_particles(
@@ -166,12 +177,11 @@ def get_predicted_particles(
     Predicted daughters per jet: the queries whose objectness passes
     `obj_cls_trsh`, optionally only on jets the tauID head accepts.
 
-    Whether a jet is a tau at all is the tauID head's decision. Objectness is
-    trained on signal jets only, so on a background jet its scores are
-    untrained and the selection they give is meaningless. Pass `tau_scores`
-    (p(tau) per jet, see `tau_scores(outputs)`) together with `tau_threshold`
-    to empty the daughter set of rejected jets; leave them out for a study
-    restricted to true tau jets, where the tagger has nothing to add.
+    Objectness is trained only on non-DM0 hadronic taus. Pass `tau_scores`
+    from `detr_tau_scores(outputs)` together with a nonnegative `tau_threshold`
+    to apply predicted routing and a confidence cut. Omit both only for a
+    diagnostic restricted to truth non-DM0 hadronic taus. Use the model's
+    decode_predictions/predict_step for the unified hybrid reconstruction.
     """
     pred_scores, pred_p4, pred_charge, pred_meson_class = _predicted_components(
         outputs, reco_jet_p4s, mass_from_class=mass_from_class
@@ -179,6 +189,8 @@ def get_predicted_particles(
     pred_mask = pred_scores >= obj_cls_trsh
     if tau_scores is not None and tau_threshold is not None:
         tagged = torch.as_tensor(tau_scores).to(pred_mask.device) >= tau_threshold
+        if "is_tau" in outputs:
+            tagged = tagged & (outputs["is_tau"].argmax(dim=-1) == TauID.HADRONIC_OTHER)
         pred_mask = pred_mask & tagged[:, None]
 
     pred_p4 = ak.drop_none(ak.mask(pred_p4, pred_mask))
@@ -434,8 +446,8 @@ def create_predictions(
 
     `tau_threshold` gates the predicted set with the tauID head (see
     get_predicted_particles). Set it whenever the sample contains background
-    jets; on a signal-only sample it only removes the true taus the tagger
-    misses, which is a tagging inefficiency and not a reconstruction one.
+    or direct-head classes; leave it unset only on truth non-DM0 hadronic
+    samples when studying the decoder independently of routing.
     """
     if mass_from_class is None:
         mass_from_class = bool(
@@ -446,7 +458,7 @@ def create_predictions(
         outputs,
         reco_jet_p4s,
         obj_cls_trsh=obj_cls_trsh,
-        tau_scores=tau_scores(outputs) if tau_threshold is not None else None,
+        tau_scores=detr_tau_scores(outputs) if tau_threshold is not None else None,
         tau_threshold=tau_threshold,
         mass_from_class=mass_from_class,
     )

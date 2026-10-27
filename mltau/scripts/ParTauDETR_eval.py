@@ -30,6 +30,7 @@ import torch
 
 from mltau.models.ParTauDETR_module import ParTauDETRModule
 from mltau.models.ParTauDETR import TAU_ID_CLASS_NAMES
+from mltau.tools.tau_id import TauID
 from mltau.tools.evaluation.decode_ParTauDETR import (
     get_predicted_particles,
     get_true_particles,
@@ -102,10 +103,18 @@ def run_model(model, ds, files, chunk, device, keep_reconstruction: bool):
         "particles_charge_ohe",
         "particles_meson_class_ohe",
         "particles_mask",
+        "gen_jet_tau_charge",
     )
     outs = {k: [] for k in out_keys}
     tgts = {k: [] for k in tgt_keys}
     refs = {k: [] for k in ("pt", "eta", "phi", "energy")}
+    gen_refs = {key: [] for key in refs}
+    branches = {
+        key: [] for key in (
+            "direct_p4", "direct_charge", "detr_p4", "detr_charge", "detr_valid",
+            "predicted_tau_class", "route_accepted",
+        )
+    }
     scores, labels, id_probabilities, id_labels = [], [], [], []
     n_jets = 0
     with torch.no_grad():
@@ -117,10 +126,18 @@ def run_model(model, ds, files, chunk, device, keep_reconstruction: bool):
                 probabilities = tau_id_probabilities(outputs)
                 if probabilities is not None:
                     id_probabilities.append(probabilities.cpu())
-                    scores.append(probabilities[:, 1].cpu())
+                    scores.append((
+                        probabilities[:, TauID.HADRONIC_DM0]
+                        + probabilities[:, TauID.HADRONIC_OTHER]
+                    ).cpu())
                 id_labels.append(targets["tau_id"].cpu())
                 labels.append(targets["is_tau"].float().cpu())
                 if keep_reconstruction:
+                    decoded = model.decode_predictions(outputs, batch[6])
+                    for key in branches:
+                        branches[key].append(decoded[key].cpu())
+                    for key in gen_refs:
+                        gen_refs[key].append(batch[5][key].cpu())
                     for k in out_keys:
                         outs[k].append(outputs[k].float().cpu())
                     for k in tgt_keys:
@@ -138,6 +155,8 @@ def run_model(model, ds, files, chunk, device, keep_reconstruction: bool):
         "n_jets": n_jets,
     }
     if keep_reconstruction:
+        result["branches"] = {key: torch.cat(values) for key, values in branches.items()}
+        result["gen_tau_p4s"] = {key: torch.cat(values) for key, values in gen_refs.items()}
         result["outputs"] = {k: torch.cat(v) for k, v in outs.items()}
         result["targets"] = {k: torch.cat(v) for k, v in tgts.items()}
         result["reco_jet_p4s"] = {k: torch.cat(v) for k, v in refs.items()}
@@ -225,8 +244,10 @@ def multiclass_tau_id_metrics(probabilities: np.ndarray, labels: np.ndarray) -> 
 
 
 def reconstruction_metrics(sig, threshold: float, mass_from_class: bool) -> dict:
-    """Object- and daughter-level reconstruction on the genuine tau jets."""
-    keep = torch.as_tensor(sig["is_tau"])
+    """DETR reconstruction on truth non-DM0 hadronic taus only."""
+    keep = torch.as_tensor(sig["tau_id"] == TauID.HADRONIC_OTHER)
+    if not keep.any():
+        return {"n_tau_jets": 0}
     outputs = {k: v[keep] for k, v in sig["outputs"].items()}
     targets = {k: v[keep] for k, v in sig["targets"].items()}
     reco_jet_p4s = {k: v[keep] for k, v in sig["reco_jet_p4s"].items()}
@@ -325,6 +346,70 @@ def reconstruction_metrics(sig, threshold: float, mass_from_class: bool) -> dict
     return results
 
 
+def routed_reconstruction_metrics(sample: dict) -> dict:
+    """Compare oracle and predicted routing on identical truth-class cohorts."""
+    branches = sample["branches"]
+    truth_classes = torch.as_tensor(sample["tau_id"])
+    truth = sample["gen_tau_p4s"]
+    truth_charge = sample["targets"]["gen_jet_tau_charge"].numpy()
+    truth_pt = truth["pt"].numpy()
+    truth_energy = truth["energy"].numpy()
+    truth_mass = np.sqrt(np.maximum(
+        truth_energy**2 - (truth_pt * np.cosh(truth["eta"].numpy())) ** 2, 0.0
+    ))
+    results = {}
+    for routing in ("truth", "predicted"):
+        classes = truth_classes if routing == "truth" else branches["predicted_tau_class"]
+        accepted = (classes != TauID.BACKGROUND) if routing == "truth" else branches["route_accepted"]
+        routed = ParTauDETRModule.route_reconstruction(branches, classes, accepted)
+        p4 = routed["tau_p4"].numpy()
+        charge = routed["tau_charge"].numpy()
+        valid = routed["reconstruction_valid"].numpy()
+        pred_pt = np.hypot(p4[:, 0], p4[:, 1])
+        pred_eta = np.arcsinh(p4[:, 2] / np.maximum(pred_pt, 1e-8))
+        pred_phi = np.arctan2(p4[:, 1], p4[:, 0])
+        pred_mass = np.sqrt(np.maximum(p4[:, 3] ** 2 - np.sum(p4[:, :3] ** 2, axis=1), 0.0))
+        delta_phi = pred_phi - truth["phi"].numpy()
+        delta_r = np.hypot(
+            pred_eta - truth["eta"].numpy(), np.arctan2(np.sin(delta_phi), np.cos(delta_phi))
+        )
+        by_class = {}
+        for class_index, class_name in enumerate(TAU_ID_CLASS_NAMES):
+            selected = sample["tau_id"] == class_index
+            reconstructed = selected & valid
+            physical = reconstructed & (truth_pt > 0) & (class_index != TauID.BACKGROUND)
+            selected_count = int(selected.sum())
+            correct_charge = reconstructed & (charge == truth_charge)
+            mass_residual = pred_mass[physical] - truth_mass[physical]
+            angular = delta_r[physical]
+            angular = angular[np.isfinite(angular)]
+            by_class[class_name] = {
+                "n_truth": selected_count,
+                "n_route_accepted": int((selected & accepted.numpy()).sum()),
+                "n_route_rejected": int((selected & ~accepted.numpy()).sum()),
+                "n_reconstructed": int(reconstructed.sum()),
+                "n_invalid_after_acceptance": int((selected & accepted.numpy() & ~valid).sum()),
+                "class_routing_accuracy": float((classes.numpy()[selected] == class_index).mean()) if selected_count else None,
+                "reconstruction_efficiency": float(reconstructed.sum() / selected_count) if selected_count else None,
+                "charge_accuracy_all": (
+                    float(correct_charge.sum() / selected_count)
+                    if selected_count and class_index != TauID.BACKGROUND else None
+                ),
+                "charge_accuracy_reconstructed": (
+                    float(correct_charge.sum() / reconstructed.sum())
+                    if reconstructed.any() and class_index != TauID.BACKGROUND else None
+                ),
+                "pt_response": iqr_resolution(pred_pt[physical] / truth_pt[physical]),
+                "energy_response": iqr_resolution(
+                    p4[physical, 3] / np.maximum(truth_energy[physical], 1e-8)
+                ),
+                "mass_residual_median": float(np.median(mass_residual)) if mass_residual.size else None,
+                "dR_median": float(np.median(angular)) if angular.size else None,
+            }
+        results[routing] = by_class
+    return results
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("checkpoint")
@@ -354,6 +439,7 @@ def main():
         "--mass-from-class", choices=("auto", "yes", "no"), default="auto",
         help="decode daughter masses from the meson class; auto = as trained",
     )
+    ap.add_argument("--routing-score-threshold", type=float, default=None)
     args = ap.parse_args()
     device = "cpu"
     torch.set_num_threads(max(1, os.cpu_count() or 1))
@@ -373,6 +459,12 @@ def main():
         if args.mass_from_class == "auto"
         else args.mass_from_class == "yes"
     )
+    model.score_threshold_calibrated.fill_(threshold)
+    model.criterion.mass_from_meson_class = mass_from_class
+    if args.routing_score_threshold is not None:
+        if not 0.0 <= args.routing_score_threshold <= 1.0:
+            ap.error("--routing-score-threshold must be between 0 and 1")
+        model.routing_score_threshold = args.routing_score_threshold
     print(
         f"objectness threshold {threshold:.4f}, mass_from_class {mass_from_class}, "
         f"data {data_dir}",
@@ -398,6 +490,8 @@ def main():
         "signal_files": [os.path.basename(f) for f in sig_files],
         "n_signal_jets": sig["n_jets"],
         "reconstruction": reconstruction_metrics(sig, threshold, mass_from_class),
+        "routed_reconstruction": routed_reconstruction_metrics(sig),
+        "routing_score_threshold": model.routing_score_threshold,
     }
 
     if args.background_files >= 0 and sig["tau_score"] is not None:
@@ -411,8 +505,10 @@ def main():
         labels = np.concatenate([sig["tau_id"], bkg["tau_id"]])
         results["background_files"] = [os.path.basename(f) for f in bkg_files]
         results["tau_id_multiclass"] = multiclass_tau_id_metrics(probabilities, labels)
-        results["tau_id"] = results["tau_id_multiclass"]["per_class"]["hadronic_tau"]["vs_background"]
-        results["tau_id_vs_rest"] = results["tau_id_multiclass"]["per_class"]["hadronic_tau"]["vs_rest"]
+        hadronic = (labels == TauID.HADRONIC_DM0) | (labels == TauID.HADRONIC_OTHER)
+        hadronic_scores = probabilities[:, TauID.HADRONIC_DM0] + probabilities[:, TauID.HADRONIC_OTHER]
+        results["tau_id"] = tau_id_metrics(hadronic_scores[hadronic], hadronic_scores[labels == TauID.BACKGROUND])
+        results["tau_id_vs_rest"] = tau_id_metrics(hadronic_scores[hadronic], hadronic_scores[~hadronic])
     elif sig["tau_score"] is None:
         print("model has no tauID head: tau-ID skipped", flush=True)
 

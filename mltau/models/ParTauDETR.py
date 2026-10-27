@@ -6,7 +6,7 @@ from torch import nn
 
 from mltau.models.ParticleTransformer import ParticleTransformer
 
-TAU_ID_CLASS_NAMES = ("background", "hadronic_tau", "tau_electron", "tau_muon")
+from mltau.tools.tau_id import TAU_ID_CLASS_NAMES
 
 
 def decode_kinematics(
@@ -96,7 +96,9 @@ class ParTauDETR(ParticleTransformer):
       - pred_meson_class_logits: configured meson classification logits
 
     Jet-level head:
-      - is_tau: logits ordered as background, hadronic tau, tau electron, tau muon.
+      - is_tau: logits in TAU_ID_CLASS_NAMES order.
+      - direct_charge_logits: visible tau positive-charge logit.
+      - direct_kinematics: visible tau regression in the same 5D basis as daughters.
     """
 
     def __init__(
@@ -205,6 +207,23 @@ class ParTauDETR(ParticleTransformer):
         self.charge_head = nn.Linear(embed_dim, num_charge_classes)
         self.meson_class_head = nn.Linear(embed_dim, num_meson_classes)
 
+        head_hidden = embed_dim // 2
+        self.cls_token_direct_charge = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.cls_token_direct_kinematics = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        nn.init.trunc_normal_(self.cls_token_direct_charge, std=0.02)
+        nn.init.trunc_normal_(self.cls_token_direct_kinematics, std=0.02)
+        self.direct_charge_head = nn.Sequential(
+            nn.Linear(embed_dim, head_hidden),
+            nn.GELU() if activation == "gelu" else nn.ReLU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(head_hidden, 1),
+        )
+        self.direct_kinematics_head = nn.Sequential(
+            nn.Linear(embed_dim, head_hidden),
+            nn.GELU() if activation == "gelu" else nn.ReLU(),
+            nn.Linear(head_hidden, 5),
+        )
+
         if tau_id_head:
             head_hidden = embed_dim // 2
             self.tau_head = nn.Sequential(
@@ -220,6 +239,8 @@ class ParTauDETR(ParticleTransformer):
     def no_weight_decay(self):
         return {
             "cls_token",
+            "cls_token_direct_charge",
+            "cls_token_direct_kinematics",
             "query_embed.weight",
         }
 
@@ -269,7 +290,10 @@ class ParTauDETR(ParticleTransformer):
         Returns:
             global_token: (1, N, C)
         """
-        cls_tokens = self.cls_token.expand(1, particle_memory.size(1), -1)
+        return self._pool_task_token(self.cls_token, particle_memory, padding_mask)
+
+    def _pool_task_token(self, token, particle_memory, padding_mask):
+        cls_tokens = token.expand(1, particle_memory.size(1), -1)
         for block in self.cls_blocks:
             cls_tokens = block(
                 particle_memory, x_cls=cls_tokens, padding_mask=padding_mask
@@ -362,6 +386,16 @@ class ParTauDETR(ParticleTransformer):
                 "pred_kinematics": self.kinematics_head(hs),
                 "pred_charge_logits": self.charge_head(hs),
                 "pred_meson_class_logits": self.meson_class_head(hs),
+                "direct_charge_logits": self.direct_charge_head(
+                    self._pool_task_token(
+                        self.cls_token_direct_charge, particle_memory, padding_mask
+                    ).squeeze(0)
+                ).squeeze(-1),
+                "direct_kinematics": self.direct_kinematics_head(
+                    self._pool_task_token(
+                        self.cls_token_direct_kinematics, particle_memory, padding_mask
+                    ).squeeze(0)
+                ),
             }
 
             if intermediate is not None and len(intermediate) > 1:

@@ -554,7 +554,7 @@ def check_output_dir(cfg: DictConfig) -> str:
 
 
 def warm_start_model(model: ParTauDETR_module.ParTauDETRModule, checkpoint_path: str) -> None:
-    """Load compatible network weights, retaining the fresh multiclass output layer."""
+    """Reuse network weights, reset ID output, and initialize absent direct heads."""
     if model.ParTauDETR.tau_head is None:
         raise ValueError("Multiclass warm start requires model.detr.tau_id_head=true.")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -565,6 +565,15 @@ def warm_start_model(model: ParTauDETR_module.ParTauDETRModule, checkpoint_path:
         if name.startswith(prefix)
     }
     fresh_state = model.ParTauDETR.state_dict()
+    direct_names = {
+        name for name in fresh_state
+        if name.startswith(("cls_token_direct_", "direct_charge_head.", "direct_kinematics_head."))
+    }
+    existing_direct_names = direct_names.intersection(network_state)
+    if existing_direct_names and existing_direct_names != direct_names:
+        raise ValueError("Warm-start checkpoint contains incomplete direct-head weights.")
+    if not existing_direct_names:
+        network_state.update({name: fresh_state[name] for name in direct_names})
     for name in ("tau_head.3.weight", "tau_head.3.bias"):
         if name not in network_state:
             raise ValueError(f"Warm-start checkpoint is missing {prefix}{name}.")
@@ -572,6 +581,7 @@ def warm_start_model(model: ParTauDETR_module.ParTauDETRModule, checkpoint_path:
     model.ParTauDETR.load_state_dict(network_state, strict=True)
     print(
         f"[ParTauDETR] warm start from {checkpoint_path}: ID output layer reset; "
+        f"direct heads {'loaded' if existing_direct_names else 'initialized'}; "
         "optimizer, scheduler and threshold calibration start fresh.",
         flush=True,
     )

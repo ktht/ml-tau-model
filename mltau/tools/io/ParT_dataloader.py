@@ -279,6 +279,10 @@ class ParticleTransformerDataset(IterableDataset):
         """
         super().__init__()
         self.cfg = cfg
+        if cfg.dataset.get("include_tau_daughter_count", False):
+            self._NEEDED_COLUMNS = list(dict.fromkeys(
+                [*self._NEEDED_COLUMNS, "gen_jet_tau_vis_daughter_pdgs"]
+            ))
         self.batch_size = batch_size
         self.row_groups = row_groups
         self.num_rows = sum(rg.num_rows for rg in self.row_groups)
@@ -694,6 +698,11 @@ class ParticleTransformerDataset(IterableDataset):
                 "decay_mode": gen_jet_tau_decaymode_ohe.float(),
                 "charge": charge_tensor.float(),
                 "is_tau": gen_jet_tau_decaymode_exists.long(),
+                **({
+                    "num_tau_daughters": torch.from_numpy(
+                        ak.to_numpy(ak.num(data.gen_jet_tau_vis_daughter_pdgs, axis=-1)).astype(np.int64)
+                    )
+                } if self.cfg.dataset.get("include_tau_daughter_count", False) else {}),
             },
             torch.from_numpy(mask_np).unsqueeze(1),  # [N, 1, max_cands]
             weight_tensors.float(),
