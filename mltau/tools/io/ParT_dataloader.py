@@ -981,6 +981,7 @@ class ParTDataModule(LightningDataModule):
     # The dataset class this module instantiates. A subclass points it at a
     # dataset with different targets and keeps everything else.
     dataset_cls = ParticleTransformerDataset
+    training_dataset_cls: type[ParticleTransformerDataset] | None = None
 
     def _select_row_groups(
         self, row_groups: list, rng: np.random.Generator
@@ -1151,7 +1152,8 @@ class ParTDataModule(LightningDataModule):
         bias every feature mean the fit produces. Not shuffled, so the scaler
         is reproducible.
         """
-        return self.dataset_cls(
+        dataset_cls = self.training_dataset_cls or self.dataset_cls
+        return dataset_cls(
             row_groups=list(row_groups),
             cfg=self.cfg,
             batch_size=self.cfg.training.dataloader.batch_size,
@@ -1221,7 +1223,8 @@ class ParTDataModule(LightningDataModule):
                 else resolve_num_workers(dl_cfg.num_dataloader_workers)
             )
             kwargs = self._dataset_kwargs(n_workers)
-            self.train_dataset = self.dataset_cls(
+            training_dataset_cls = self.training_dataset_cls or self.dataset_cls
+            self.train_dataset = training_dataset_cls(
                 row_groups=train_row_groups,
                 cfg=self.cfg,
                 batch_size=batch_size,

@@ -13,11 +13,13 @@ from mltau.tools.io.ParT_dataloader import (
     sort_candidates_by_pt,
 )
 from mltau.tools.io import input_scaling as scaling
+from mltau.tools.io.general import RowGroup
 from mltau.tools.meson_classes import (
     get_meson_class_groups,
     pdg_to_meson_class_indices,
 )
 
+from ntupelizer.tools.tau_decaymode import MIXED_DECAY_MODE
 
 class ParticleTransformerDETRDataset(ParticleTransformerDataset):
     """
@@ -563,11 +565,39 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
         ))
 
 
+class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
+    """Exclude mixed decay mode while preserving exact training row counts."""
 
+    def __init__(self, row_groups, cfg, **kwargs):
+        import pyarrow.parquet as pq
 
+        by_file = {}
+        for group in row_groups:
+            by_file.setdefault(group.filename, []).append(group)
 
+        retained_groups = []
+        excluded_rows = 0
+        for filename, groups in by_file.items():
+            with pq.ParquetFile(filename) as parquet:
+                for group in groups:
+                    data = ak.from_arrow(parquet.read_row_group(
+                        group.row_group, columns=["gen_jet_tau_decaymode"]
+                    ))
+                    retained_rows = int(ak.sum(data.gen_jet_tau_decaymode != MIXED_DECAY_MODE))
+                    excluded_rows += len(data) - retained_rows
+                    if retained_rows:
+                        retained_groups.append(
+                            RowGroup(filename, group.row_group, retained_rows)
+                        )
 
+        print(
+            f"[dataset] Excluded {excluded_rows:,} decay-mode-{MIXED_DECAY_MODE} training jets.",
+            flush=True,
+        )
+        super().__init__(row_groups=retained_groups, cfg=cfg, **kwargs)
 
+    def build_tensors(self, data: ak.Array):
+        return super().build_tensors(data[data.gen_jet_tau_decaymode != MIXED_DECAY_MODE])
 
 
 class ParTauDETRDataModule(ParTDataModule):
@@ -575,11 +605,13 @@ class ParTauDETRDataModule(ParTDataModule):
     DataModule variant using ParticleTransformerDETRDataset.
 
     File discovery, the train/val split, the scaler fit and the stratified
-    batch composition are all the base class's; only the dataset class and the
-    sample selection differ.
+    batch composition are all the base class's. Training and scaler fitting
+    exclude mixed leptonic and hadronic decay mode; validation, testing and
+    inference retain all modes.
     """
 
     dataset_cls = ParticleTransformerDETRDataset
+    training_dataset_cls = ParticleTransformerDETRTrainingDataset
 
     def __init__(self, cfg: DictConfig, debug_run: bool = False):
         super().__init__(cfg=cfg, debug_run=debug_run)
