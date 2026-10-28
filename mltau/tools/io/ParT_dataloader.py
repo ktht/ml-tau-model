@@ -1231,7 +1231,7 @@ class ParTDataModule(LightningDataModule):
                 shuffle=True,
                 **kwargs,
             )
-            self.val_dataset = self.dataset_cls(
+            self.val_dataset = training_dataset_cls(
                 row_groups=val_row_groups,
                 cfg=self.cfg,
                 batch_size=batch_size,
