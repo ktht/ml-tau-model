@@ -1293,7 +1293,9 @@ class SetCriterion(nn.Module):
             "loss_direct_charge": loss_direct_charge,
             "loss_direct_kinematics": loss_direct_kinematics,
             **{
-                f"direct_kinematics_{name}": direct_components.get(name, pred_logits.new_zeros(()))
+                f"direct_kinematics_{name}": (
+                    direct_components[name] if direct_components else pred_logits.new_zeros(())
+                )
                 for name in ("log_pt", "delta_eta", "phi_chord", "log_mass")
             },
             "loss_objectness": loss_objectness,
@@ -1583,6 +1585,7 @@ class ParTauDETRModule(L.LightningModule):
         )
         self.grad_clip_val = float(_trainer_cfg.get("gradient_clip_val", 1.0))
         self._consecutive_skips = 0
+        self._last_training_losses: dict[str, torch.Tensor] = {}
         # One warning per run for the start-up transient, not one per step.
         self._warned_warmup_grad = False
 
@@ -1738,6 +1741,11 @@ class ParTauDETRModule(L.LightningModule):
             jet_weights=weights,
             objectness_threshold=self.score_threshold_calibrated,
         )
+
+        self._last_training_losses = {
+            name: value.detach() for name, value in losses.items()
+            if name.startswith("loss_") or name == "loss"
+        }
 
         for name in ("loss_direct_charge", "loss_direct_kinematics"):
             self.log(f"train_losses/{name.removeprefix('loss_')}", losses[name], on_step=False, on_epoch=True)
@@ -2433,16 +2441,38 @@ class ParTauDETRModule(L.LightningModule):
                 else:
                     skipped = False
                 if skipped:
+                    self._consecutive_skips += 1
+                    if self._consecutive_skips == 1 or self._consecutive_skips > self.grad_skip_patience:
+                        largest = sorted(
+                            (
+                                (float(torch.linalg.vector_norm(parameter.grad.detach().float())), name)
+                                for name, parameter in self.named_parameters()
+                                if parameter.grad is not None
+                            ),
+                            reverse=True,
+                        )[:5]
+                        loss_details = ", ".join(
+                            f"{name}={float(value):.4g}"
+                            for name, value in self._last_training_losses.items()
+                            if name == "loss" or float(value) != 0.0
+                        )
+                        diagnostics = (
+                            f"step={self.trainer.global_step}, "
+                            f"lr={optimizer.param_groups[0]['lr']:.4g}, "
+                            f"losses: {loss_details}; largest gradient norms: {largest}"
+                        )
+                        if self._consecutive_skips == 1:
+                            warnings.warn(f"first skipped gradient (norm={total_value}): {diagnostics}")
                     for parameter in self.parameters():
                         if parameter.grad is not None:
                             parameter.grad.zero_()
-                    self._consecutive_skips += 1
                     if self._consecutive_skips > self.grad_skip_patience:
                         raise RuntimeError(
                             f"gradient norm non-finite or above "
                             f"{self.grad_skip_norm} for "
                             f"{self._consecutive_skips} consecutive steps "
-                            f"(last: {total_value}); the run has diverged."
+                            f"(last: {total_value}); the run has diverged. "
+                            f"{diagnostics}"
                         )
                 else:
                     self._consecutive_skips = 0

@@ -210,10 +210,10 @@ model:
         # null uses the unscaled loss; never inherit a disabled daughter mass loss.
         # ./run.sh python mltau/scripts/measure_kinematics_scales.py --model DETR --daughters single
         kinematics_scales:
-            log_pt: 0.181
-            delta_eta: 0.0209
-            phi_chord: 0.0251
-            log_mass: 1.31
+            log_pt: 0.219
+            delta_eta: 0.0174
+            phi_chord: 0.0297
+            log_mass: 2.55
         kinematics_weights:
             log_pt: 1.0
             delta_eta: 1.0
@@ -238,9 +238,9 @@ model:
         # ./run.sh python mltau/scripts/measure_kinematics_scales.py --model DETR --daughters multiple
         kinematics_scales:
             log_pt: 0.831
-            delta_eta: 0.0727
-            phi_chord: 0.076
-            log_mass: 0.814
+            delta_eta: 0.0736
+            phi_chord: 0.0768
+            log_mass: 0.82
         # With the residuals scaled, equal weights give each component an equal
         # share. log_mass is the one worth reconsidering rather than reweighting:
         # only 4.8% of the variance of log(m_dau/m_jet) comes from the daughter's
