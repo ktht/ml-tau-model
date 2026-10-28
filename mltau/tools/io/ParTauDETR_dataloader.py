@@ -537,7 +537,7 @@ class ParticleTransformerDETRDataset(ParticleTransformerDataset):
 
 
 class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
-    """Exclude mixed decay mode while preserving exact training row counts."""
+    """Exclude mixed decay mode for train/validation with exact row counts."""
 
     def __init__(self, row_groups, cfg, **kwargs):
         import pyarrow.parquet as pq
@@ -562,7 +562,7 @@ class ParticleTransformerDETRTrainingDataset(ParticleTransformerDETRDataset):
                         )
 
         print(
-            f"[dataset] Excluded {excluded_rows:,} decay-mode-{MIXED_DECAY_MODE} training jets.",
+            f"[dataset] Excluded {excluded_rows:,} decay-mode-{MIXED_DECAY_MODE} jets from fit-stage dataset.",
             flush=True,
         )
         super().__init__(row_groups=retained_groups, cfg=cfg, **kwargs)
@@ -576,8 +576,8 @@ class ParTauDETRDataModule(ParTDataModule):
     DataModule variant using ParticleTransformerDETRDataset.
 
     File discovery, the train/val split, the scaler fit and the stratified
-    batch composition are all the base class's. Training and scaler fitting
-    exclude mixed leptonic and hadronic decay mode; validation, testing and
+    batch composition are all the base class's. Training, validation and scaler
+    fitting exclude mixed leptonic and hadronic decay mode; testing and
     inference retain all modes.
     """
 
