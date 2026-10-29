@@ -1744,7 +1744,7 @@ class ParTauDETRModule(L.LightningModule):
 
         self._last_training_losses = {
             name: value.detach() for name, value in losses.items()
-            if name.startswith("loss_") or name == "loss"
+            if name.startswith(("loss_", "direct_kinematics_")) or name == "loss"
         }
 
         for name in ("loss_direct_charge", "loss_direct_kinematics"):
@@ -2456,10 +2456,17 @@ class ParTauDETRModule(L.LightningModule):
                             for name, value in self._last_training_losses.items()
                             if name == "loss" or float(value) != 0.0
                         )
+                        direct_head = self.ParTauDETR.direct_kinematics_head[-1]
+                        component_norms = torch.linalg.vector_norm(
+                            direct_head.weight.grad.detach().float(), dim=1
+                        ).tolist()
                         diagnostics = (
                             f"step={self.trainer.global_step}, "
                             f"lr={optimizer.param_groups[0]['lr']:.4g}, "
-                            f"losses: {loss_details}; largest gradient norms: {largest}"
+                            f"raw losses (including zero-weight terms): {loss_details}; "
+                            f"direct head output gradient norms "
+                            f"[log_pt, delta_eta, sin_phi, cos_phi, log_mass]: "
+                            f"{component_norms}; largest gradient norms: {largest}"
                         )
                         if self._consecutive_skips == 1:
                             warnings.warn(f"first skipped gradient (norm={total_value}): {diagnostics}")

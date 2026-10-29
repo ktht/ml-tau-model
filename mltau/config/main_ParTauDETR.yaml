@@ -259,6 +259,12 @@ training:
     # in 4 runs once the combined losses above were on; 2e-4 was stable over
     # two seeds and a 120-epoch run.
     lr: 0.0003
+    optimizer:
+        # The shared default of 50 was calibrated before the direct heads and
+        # per-component residual scaling. Finite norms of 100-156 now recur
+        # with ordinary losses, so that cutoff deadlocks training after warmup.
+        # Leave the 5.0 clip active; keep a guard for much larger outliers.
+        grad_skip_norm: 500.0
     # Standardise the continuous candidate inputs (see training.yaml). The
     # signed impact-parameter significances reach |s| ~ 1e4 unscaled.
     input_scaling:
